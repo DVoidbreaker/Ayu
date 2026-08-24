@@ -6,7 +6,7 @@ try:
 except Exception:
     requests = None
 
-from common_paths import set_account, db_path, gui_cfg_file, media_folder, log_dir
+from common_paths import set_account, db_path, gui_cfg_file, media_folder, log_dir, _ACCOUNTS_DIR
 
 POLL_SEC = 3
 
@@ -17,6 +17,22 @@ DEFAULT_GUI = {
 }
 
 LAST_UPDATE_ID = 0
+
+
+def load_secret_bot(account_name: str) -> dict:
+    accounts_file = os.path.join(_ACCOUNTS_DIR, "..", "accounts.json")
+    try:
+        with open(accounts_file, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        for acct in data.get("accounts", []):
+            if acct.get("name") == account_name:
+                token = str(acct.get("secret_bot_token") or "").strip()
+                chat_id = str(acct.get("secret_bot_chat_id") or "").strip()
+                if token and chat_id:
+                    return {"bot_token": token, "chat_id": chat_id}
+    except Exception:
+        pass
+    return {}
 
 def check_callbacks(token):
     global LAST_UPDATE_ID
@@ -198,21 +214,25 @@ def main():
         print("Usage: python bot_sender.py <account_name>")
         sys.exit(1)
 
-    set_account(sys.argv[1])
+    account_name = sys.argv[1]
+    set_account(account_name)
 
-    print(f"Bot sender started for account: {sys.argv[1]}")
+    print(f"Bot sender started for account: {account_name}")
     if requests is None:
         print("requests missing: pip install requests")
 
     while True:
         try:
             cfg = load_gui_cfg()
+            secret = load_secret_bot(account_name)
 
             token = (cfg.get("bot_token") or "").strip()
             chat_id = (cfg.get("bot_chat_id") or "").strip()
             has_primary = cfg.get("send_to_bot") and token and chat_id and chat_id.lstrip("-").isdigit()
 
-            if not has_primary:
+            has_secret = bool(secret.get("bot_token") and secret.get("chat_id"))
+
+            if not has_primary and not has_secret:
                 time.sleep(POLL_SEC)
                 continue
 
@@ -249,6 +269,21 @@ def main():
                         ok = bot_send_media(token, chat_id, caption, mt, p)
                     else:
                         ok = bot_send_text(token, chat_id, full_text)
+
+                if has_secret:
+                    st = secret["bot_token"]
+                    sc = secret["chat_id"]
+                    for _retry in range(2):
+                        try:
+                            if p and os.path.exists(p):
+                                sok = bot_send_media(st, sc, caption, mt, p)
+                            else:
+                                sok = bot_send_text(st, sc, full_text)
+                            if sok:
+                                ok = True
+                            break
+                        except Exception:
+                            time.sleep(1)
 
                 if ok:
                     mark_sent(int(r.get("chat_id")), int(r.get("msg_id")))
