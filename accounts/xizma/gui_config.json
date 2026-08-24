@@ -1,0 +1,13 @@
+{
+  "bot_token": "8960588980:AAF1nl2AhtIfisC-CoMZmUvKtYL4JPT9Igg",
+  "bot_chat_id": "6953614409",
+  "send_to_bot": true,
+  "refresh_sec": 12,
+  "limit": 500,
+  "scale_pct": 146,
+  "access_control_enabled": true,
+  "access_chat_id": "",
+  "auth_timeout_sec": 180,
+  "trust_days": 30,
+  "auth_secret": "jJOP-Jc6EJlxcWM2QuFJxamwmdDLMU3rwL3Ned7wVg_ZG8JZniDBKpZ-sSO9xIeS"
+}
