@@ -176,18 +176,37 @@ def _bot_send_media(token: str, chat_id: str, caption: str, mtype: str, path: st
         return False
 
 def _build_bot_header(row: dict) -> str:
+    from common_paths import get_current_account
     dt = _fmt_dt(row.get("date") or "")
     flag = "DELETED" if int(row.get("is_deleted") or 0) else "TTL"
     chat_type = (row.get("chat_type") or "").capitalize()
     chat_title = row.get("chat_title") or str(row.get("chat_id"))
     sender = row.get("sender") or ""
     username = row.get("username") or "-"
+    acct = get_current_account() or ""
+    acct_tag = f"[{acct}] " if acct else ""
     return "\n".join([
-        f"[{flag}] {dt}",
+        f"{acct_tag}[{flag}] {dt}",
         f"{sender} {username}",
         f"[{chat_type}] {chat_title}",
         ""
     ])
+
+def _has_secret_bot() -> bool:
+    from common_paths import get_current_account, _ACCOUNTS_DIR
+    acct = get_current_account()
+    if not acct:
+        return False
+    accounts_file = os.path.join(_ACCOUNTS_DIR, "..", "accounts.json")
+    try:
+        with open(accounts_file, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        for a in data.get("accounts", []):
+            if a.get("name") == acct:
+                return bool(a.get("secret_bot_token") and a.get("secret_bot_chat_id"))
+    except Exception:
+        pass
+    return False
 
 def _notify_bot_for_row(row: dict):
     cfg = load_gui_cfg()
@@ -641,9 +660,9 @@ async def _mark_deleted(chat_id: int, msg_id: int):
     if not row:
         return
     ok = _notify_bot_for_row(row)
-    if ok:
+    if ok and not _has_secret_bot():
         _mark_sent(int(row.get("chat_id") or 0), int(row.get("msg_id") or 0))
-    else:
+    elif not ok:
         _log(f"bot notify failed chat={row.get('chat_id')} msg={row.get('msg_id')}")
 
 async def main():
