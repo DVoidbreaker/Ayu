@@ -906,6 +906,11 @@ audio.media-preview{min-height:56px}
           <input class="input" id="b_chat" placeholder="Chat ID" />
         </div>
         <div class="switch"><label>Отправлять</label><input type="checkbox" id="b_send"/></div>
+        <div class="switch"><label>Не слать из чата бота</label><input type="checkbox" id="b_exclude_own" checked/></div>
+        <div style="margin-top:10px">
+          <div class="small">Исключения (каждое с новой строки: @ник, номер, ID чата)</div>
+          <textarea class="input" id="b_exclude_list" rows="4" placeholder="@username&#10;+79001234567&#10;123456789" style="resize:vertical;font-family:inherit"></textarea>
+        </div>
 
         <div class="actions">
           <button class="btn okbtn" onclick="saveSettings()">Сохранить</button>
@@ -1159,7 +1164,8 @@ async function loadSettings(){
 }
 
 async function saveBot(silent=false){
-  const payload={bot_token:b_token.value.trim(), bot_chat_id:b_chat.value.trim(), send_to_bot:b_send.checked};
+  const exRaw=(b_exclude_list.value||'').split('\n').map(s=>s.trim()).filter(s=>s);
+  const payload={bot_token:b_token.value.trim(), bot_chat_id:b_chat.value.trim(), send_to_bot:b_send.checked, exclude_own_chat:b_exclude_own.checked, exclude_from_bot:exRaw};
   const j=await (await fetch(PFX+'api/bot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})).json();
   if(!silent) toast(j.ok?'ok':'err');
   bot_note.textContent=j.msg||'';
@@ -1190,6 +1196,9 @@ async function saveSettings(){
 async function loadBot(){
   const b=await (await fetch(PFX+'api/bot')).json();
   b_token.value=b.bot_token||''; b_chat.value=b.bot_chat_id||''; b_send.checked=!!b.send_to_bot;
+  b_exclude_own.checked=b.exclude_own_chat!==false;
+  const exList=b.exclude_from_bot||[];
+  b_exclude_list.value=exList.join('\n');
   bot_note.textContent='';
 }
 
@@ -1802,6 +1811,8 @@ def create_account_blueprint(account_name):
             "access_chat_id": cfg.get("access_chat_id", ""),
             "auth_timeout_sec": int(cfg.get("auth_timeout_sec") or 180),
             "trust_days": int(cfg.get("trust_days") or 30),
+            "exclude_own_chat": bool(cfg.get("exclude_own_chat", True)),
+            "exclude_from_bot": cfg.get("exclude_from_bot") or [],
         })
 
     @bp.post("/api/bot")
@@ -1816,6 +1827,8 @@ def create_account_blueprint(account_name):
         access_chat_id = str(data.get("access_chat_id", current_cfg.get("access_chat_id", "")) or "").strip()
         auth_timeout_sec = max(30, min(int(data.get("auth_timeout_sec", current_cfg.get("auth_timeout_sec", 180)) or 180), 900))
         trust_days = max(1, min(int(data.get("trust_days", current_cfg.get("trust_days", 30)) or 30), 365))
+        exclude_own_chat = bool(data.get("exclude_own_chat", True))
+        exclude_from_bot = data.get("exclude_from_bot") or []
 
         ok = True
         msg = ""
@@ -1834,6 +1847,8 @@ def create_account_blueprint(account_name):
                 "access_chat_id": access_chat_id,
                 "auth_timeout_sec": auth_timeout_sec,
                 "trust_days": trust_days,
+                "exclude_own_chat": exclude_own_chat,
+                "exclude_from_bot": exclude_from_bot,
             })
             msg = "Saved."
         return jsonify({"ok": ok, "msg": msg})

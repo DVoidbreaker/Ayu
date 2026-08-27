@@ -39,6 +39,8 @@ DEFAULT_GUI = {
     "bot_token": "",
     "bot_chat_id": "",
     "send_to_bot": False,
+    "exclude_own_chat": True,
+    "exclude_from_bot": [],
 }
 
 def _detect_session_cols():
@@ -208,6 +210,35 @@ def _has_secret_bot() -> bool:
         pass
     return False
 
+def _is_excluded_from_bot(row: dict) -> bool:
+    cfg = load_gui_cfg()
+    bot_chat_id = (cfg.get("bot_chat_id") or "").strip()
+
+    if cfg.get("exclude_own_chat", True) and bot_chat_id:
+        row_chat = str(row.get("chat_id") or "")
+        if row_chat == bot_chat_id:
+            return True
+
+    exclude_list = cfg.get("exclude_from_bot") or []
+    if not exclude_list:
+        return False
+
+    exclude_lower = [str(e).lower().strip() for e in exclude_list if e]
+    if not exclude_lower:
+        return False
+
+    sender = str(row.get("sender") or "").lower().strip()
+    username = str(row.get("username") or "").lower().strip().lstrip("@")
+    phone = str(row.get("phone") or "").lower().strip()
+    chat_title = str(row.get("chat_title") or "").lower().strip()
+    chat_id = str(row.get("chat_id") or "")
+
+    for exc in exclude_lower:
+        if exc and (exc == sender or exc == username or exc == phone or exc == chat_title or exc == chat_id):
+            return True
+
+    return False
+
 def _notify_bot_for_row(row: dict):
     cfg = load_gui_cfg()
     token = (cfg.get("bot_token") or "").strip()
@@ -216,6 +247,8 @@ def _notify_bot_for_row(row: dict):
         return False
     if int(row.get("sent_to_bot") or 0):
         return True
+    if _is_excluded_from_bot(row):
+        return False
 
     header = _build_bot_header(row)
     text = (row.get("text") or "")

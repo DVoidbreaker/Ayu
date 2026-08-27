@@ -14,6 +14,8 @@ DEFAULT_GUI = {
     "bot_token": "",
     "bot_chat_id": "",
     "send_to_bot": False,
+    "exclude_own_chat": True,
+    "exclude_from_bot": [],
 }
 
 LAST_UPDATE_ID = 0
@@ -97,6 +99,34 @@ def load_gui_cfg() -> dict:
         return out
     except Exception:
         return dict(DEFAULT_GUI)
+
+def is_excluded_from_bot(row: dict, cfg: dict) -> bool:
+    bot_chat_id = (cfg.get("bot_chat_id") or "").strip()
+
+    if cfg.get("exclude_own_chat", True) and bot_chat_id:
+        row_chat = str(row.get("chat_id") or "")
+        if row_chat == bot_chat_id:
+            return True
+
+    exclude_list = cfg.get("exclude_from_bot") or []
+    if not exclude_list:
+        return False
+
+    exclude_lower = [str(e).lower().strip() for e in exclude_list if e]
+    if not exclude_lower:
+        return False
+
+    sender = str(row.get("sender") or "").lower().strip()
+    username = str(row.get("username") or "").lower().strip().lstrip("@")
+    phone = str(row.get("phone") or "").lower().strip()
+    chat_title = str(row.get("chat_title") or "").lower().strip()
+    chat_id = str(row.get("chat_id") or "")
+
+    for exc in exclude_lower:
+        if exc and (exc == sender or exc == username or exc == phone or exc == chat_title or exc == chat_id):
+            return True
+
+    return False
 
 def fmt_dt(dt_raw: str) -> str:
     try:
@@ -256,6 +286,10 @@ def main():
             conn.close()
 
             for r in rows:
+                if is_excluded_from_bot(r, cfg):
+                    mark_sent(int(r.get("chat_id")), int(r.get("msg_id")))
+                    continue
+
                 text = (r.get("text") or "")
                 p = (r.get("media_path") or "").strip()
                 mt = (r.get("media_type") or "").strip()
