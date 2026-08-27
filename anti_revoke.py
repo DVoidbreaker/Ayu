@@ -110,8 +110,10 @@ def load_gui_cfg() -> dict:
             return dict(DEFAULT_GUI)
         with open(gf, "r", encoding="utf-8") as f:
             data = json.load(f) or {}
-        out = dict(DEFAULT_GUI)
-        out.update({k: data.get(k, out[k]) for k in DEFAULT_GUI})
+        out = dict(data)
+        for k, v in DEFAULT_GUI.items():
+            if k not in out:
+                out[k] = v
         out["send_to_bot"] = bool(out.get("send_to_bot", False))
         return out
     except Exception:

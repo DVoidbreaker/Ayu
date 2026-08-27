@@ -118,6 +118,8 @@ DEFAULT_GUI = {
     "auth_timeout_sec": 180,
     "trust_days": 30,
     "auth_secret": "",
+    "exclude_own_chat": True,
+    "exclude_from_bot": [],
 }
 
 def _load_gui_cfg(account_name):
@@ -132,8 +134,10 @@ def _load_gui_cfg(account_name):
             return seed
         with open(gf, "r", encoding="utf-8") as f:
             data = json.load(f) or {}
-        out = dict(DEFAULT_GUI)
-        out.update({k: data.get(k, out[k]) for k in DEFAULT_GUI})
+        out = dict(data)
+        for k, v in DEFAULT_GUI.items():
+            if k not in out:
+                out[k] = v
         if not out.get("auth_secret"):
             out["auth_secret"] = secrets.token_urlsafe(48)
             with open(gf, "w", encoding="utf-8") as f:
