@@ -246,12 +246,19 @@ def _db_ok(account_name):
     set_account(account_name)
     return os.path.exists(db_path())
 
+def _conn():
+    dp = db_path()
+    c = sqlite3.connect(dp, timeout=30)
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA busy_timeout=30000;")
+    c.row_factory = sqlite3.Row
+    return c
+
 def _ensure_schema(account_name):
     if not _db_ok(account_name):
         return
     set_account(account_name)
-    dp = db_path()
-    conn = sqlite3.connect(dp, timeout=10)
+    conn = _conn()
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout=10000;")
     conn.execute("""
@@ -2231,8 +2238,7 @@ def create_account_blueprint(account_name):
         _ensure_schema(account_name)
         run_cleanup(_load_settings(account_name), logger=_log)
         set_account(account_name)
-        dp = db_path()
-        conn = sqlite3.connect(dp, timeout=10)
+        conn = _conn()
         cur = conn.cursor()
         total = cur.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         hidden = cur.execute("SELECT COUNT(*) FROM messages WHERE is_deleted=1 OR is_ephemeral=1").fetchone()[0]
@@ -2253,9 +2259,7 @@ def create_account_blueprint(account_name):
         q = (request.args.get("q", "") or "").strip()
 
         set_account(account_name)
-        dp = db_path()
-        conn = sqlite3.connect(dp, timeout=10)
-        conn.row_factory = sqlite3.Row
+        conn = _conn()
         cur = conn.cursor()
 
         where = []
@@ -2306,9 +2310,7 @@ def create_account_blueprint(account_name):
             return jsonify({"ok": True, "chats": []})
         _ensure_schema(account_name)
         set_account(account_name)
-        dp = db_path()
-        conn = sqlite3.connect(dp, timeout=10)
-        conn.row_factory = sqlite3.Row
+        conn = _conn()
         cur = conn.cursor()
         q = (request.args.get("q", "") or "").strip()
         where = ""
@@ -2356,9 +2358,7 @@ def create_account_blueprint(account_name):
             return jsonify({"ok": False, "error": "DB not found"})
         _ensure_schema(account_name)
         set_account(account_name)
-        dp = db_path()
-        conn = sqlite3.connect(dp, timeout=10)
-        conn.row_factory = sqlite3.Row
+        conn = _conn()
         cur = conn.cursor()
         limit = max(1, min(int(request.args.get("limit", "200")), 500))
         offset = max(0, int(request.args.get("offset", "0")))
@@ -2468,8 +2468,7 @@ def create_account_blueprint(account_name):
             return jsonify({"ok": False, "error": "Enter username/phone/ID"})
 
         set_account(account_name)
-        dp = db_path()
-        conn = sqlite3.connect(dp, timeout=10)
+        conn = _conn()
         cur = conn.cursor()
         clean = identifier.lstrip("@")
         cur.execute("""
@@ -2517,9 +2516,7 @@ def create_account_blueprint(account_name):
         offset = max(0, int(request.args.get("offset", 0)))
 
         set_account(account_name)
-        dp = db_path()
-        conn = sqlite3.connect(dp, timeout=10)
-        conn.row_factory = sqlite3.Row
+        conn = _conn()
         cur = conn.cursor()
 
         cur.execute("""
@@ -2578,9 +2575,7 @@ def create_account_blueprint(account_name):
             return jsonify({"ok": False, "error": "Invalid chat_id"})
 
         set_account(account_name)
-        dp = db_path()
-        conn = sqlite3.connect(dp, timeout=10)
-        conn.row_factory = sqlite3.Row
+        conn = _conn()
         cur = conn.cursor()
         cur.execute("""
             SELECT msg_id, text, date, media_path, media_type, is_outgoing
@@ -2624,8 +2619,7 @@ def create_account_blueprint(account_name):
             return jsonify({"ok": False, "error": "chat_id and msg_ids required"})
 
         set_account(account_name)
-        dp = db_path()
-        conn = sqlite3.connect(dp, timeout=10)
+        conn = _conn()
         cur = conn.cursor()
         for mid in msg_ids:
             cur.execute("""
@@ -2669,8 +2663,7 @@ def create_account_blueprint(account_name):
             return jsonify({"ok": False, "error": "chat_id, msg_id and text required"})
 
         set_account(account_name)
-        dp = db_path()
-        conn = sqlite3.connect(dp, timeout=10)
+        conn = _conn()
         cur = conn.cursor()
         cur.execute("UPDATE messages SET text=? WHERE chat_id=? AND msg_id=?", (new_text, int(chat_id), int(msg_id)))
         conn.commit()
@@ -2713,8 +2706,7 @@ def create_account_blueprint(account_name):
                 return jsonify({"ok": False, "error": "chat_id and msg_id required"})
 
             set_account(account_name)
-            dp = db_path()
-            conn = sqlite3.connect(dp, timeout=10)
+            conn = _conn()
             cur = conn.cursor()
             cur.execute("SELECT media_path, text, sender, date FROM messages WHERE chat_id=? AND msg_id=?", (int(chat_id), int(msg_id)))
             row = cur.fetchone()
@@ -2755,8 +2747,7 @@ def create_account_blueprint(account_name):
         where_media = "media_path IS NOT NULL AND media_path != ''"
 
         set_account(account_name)
-        dp = db_path()
-        conn = sqlite3.connect(dp, timeout=10)
+        conn = _conn()
         cur = conn.cursor()
         cur.execute(f"""
             SELECT media_path, media_type, text, date, sender
@@ -2894,8 +2885,7 @@ def create_account_blueprint(account_name):
             chat_title = result.get("chat_title", "")
             chat_type = result.get("chat_type", "private")
             saved = 0
-            dp = db_path()
-            conn = sqlite3.connect(dp, timeout=10)
+            conn = _conn()
             cur = conn.cursor()
             for m in messages:
                 msg_id_m = m.get("msg_id")
@@ -2957,8 +2947,7 @@ def create_account_blueprint(account_name):
             media_path = result.get("media_path")
             media_type = result.get("media_type", "")
             if media_path:
-                dp = db_path()
-                conn = sqlite3.connect(dp, timeout=10)
+                conn = _conn()
                 cur = conn.cursor()
                 cur.execute("UPDATE messages SET media_path=?, media_type=? WHERE chat_id=? AND msg_id=?",
                             (media_path, media_type, int(chat_id), int(msg_id)))
