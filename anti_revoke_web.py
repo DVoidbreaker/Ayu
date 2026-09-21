@@ -71,6 +71,8 @@ DEFAULT_SETTINGS = {
     "retention_days": 30,
     "storage_soft_limit_mb": 420,
     "storage_target_mb": 360,
+    "storage_mode": "light",
+    "text_retention_days": 7,
 }
 
 def _load_settings(account_name):
@@ -249,7 +251,7 @@ def _ensure_schema(account_name):
         return
     set_account(account_name)
     dp = db_path()
-    conn = sqlite3.connect(dp)
+    conn = sqlite3.connect(dp, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("""
     CREATE TABLE IF NOT EXISTS messages (
@@ -2229,7 +2231,7 @@ def create_account_blueprint(account_name):
         run_cleanup(_load_settings(account_name), logger=_log)
         set_account(account_name)
         dp = db_path()
-        conn = sqlite3.connect(dp)
+        conn = sqlite3.connect(dp, timeout=10)
         cur = conn.cursor()
         total = cur.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         hidden = cur.execute("SELECT COUNT(*) FROM messages WHERE is_deleted=1 OR is_ephemeral=1").fetchone()[0]
@@ -2251,7 +2253,7 @@ def create_account_blueprint(account_name):
 
         set_account(account_name)
         dp = db_path()
-        conn = sqlite3.connect(dp)
+        conn = sqlite3.connect(dp, timeout=10)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
@@ -2304,7 +2306,7 @@ def create_account_blueprint(account_name):
         _ensure_schema(account_name)
         set_account(account_name)
         dp = db_path()
-        conn = sqlite3.connect(dp)
+        conn = sqlite3.connect(dp, timeout=10)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         q = (request.args.get("q", "") or "").strip()
@@ -2354,7 +2356,7 @@ def create_account_blueprint(account_name):
         _ensure_schema(account_name)
         set_account(account_name)
         dp = db_path()
-        conn = sqlite3.connect(dp)
+        conn = sqlite3.connect(dp, timeout=10)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         limit = max(1, min(int(request.args.get("limit", "200")), 500))
@@ -2466,7 +2468,7 @@ def create_account_blueprint(account_name):
 
         set_account(account_name)
         dp = db_path()
-        conn = sqlite3.connect(dp)
+        conn = sqlite3.connect(dp, timeout=10)
         cur = conn.cursor()
         clean = identifier.lstrip("@")
         cur.execute("""
@@ -2515,7 +2517,7 @@ def create_account_blueprint(account_name):
 
         set_account(account_name)
         dp = db_path()
-        conn = sqlite3.connect(dp)
+        conn = sqlite3.connect(dp, timeout=10)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
@@ -2576,7 +2578,7 @@ def create_account_blueprint(account_name):
 
         set_account(account_name)
         dp = db_path()
-        conn = sqlite3.connect(dp)
+        conn = sqlite3.connect(dp, timeout=10)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute("""
@@ -2753,7 +2755,7 @@ def create_account_blueprint(account_name):
 
         set_account(account_name)
         dp = db_path()
-        conn = sqlite3.connect(dp)
+        conn = sqlite3.connect(dp, timeout=10)
         cur = conn.cursor()
         cur.execute(f"""
             SELECT media_path, media_type, text, date, sender

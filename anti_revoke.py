@@ -33,6 +33,8 @@ DEFAULT_SETTINGS = {
     "retention_days": 30,
     "storage_soft_limit_mb": 420,
     "storage_target_mb": 360,
+    "storage_mode": "light",
+    "text_retention_days": 7,
 }
 
 DEFAULT_GUI = {
@@ -449,7 +451,7 @@ def _build_runtime_session():
     return sb
 
 def ensure_schema():
-    conn = sqlite3.connect(db_path())
+    conn = sqlite3.connect(db_path(), timeout=10)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("""
     CREATE TABLE IF NOT EXISTS messages (
@@ -600,6 +602,7 @@ def _is_service_message(sender, text: str) -> bool:
 
 async def _save_message(client: TelegramClient, msg: Message):
     s = load_settings()
+    light_mode = s.get("storage_mode", "light") == "light"
 
     chat_id, chat_title, chat_type = await _resolve_chat_info(client, msg)
 
@@ -610,18 +613,20 @@ async def _save_message(client: TelegramClient, msg: Message):
     username = ""
     phone = ""
     sender = None
-    try:
-        sender = await msg.get_sender()
-        if sender:
-            sender_name = " ".join(
-                [p for p in [getattr(sender, "first_name", ""), getattr(sender, "last_name", "")] if p]
-            ).strip()
-            username = getattr(sender, "username", "") or ""
-            phone = getattr(sender, "phone", "") or ""
-    except Exception:
-        pass
 
-    if _is_service_message(sender, msg.message or ""):
+    if not light_mode:
+        try:
+            sender = await msg.get_sender()
+            if sender:
+                sender_name = " ".join(
+                    [p for p in [getattr(sender, "first_name", ""), getattr(sender, "last_name", "")] if p]
+                ).strip()
+                username = getattr(sender, "username", "") or ""
+                phone = getattr(sender, "phone", "") or ""
+        except Exception:
+            pass
+
+    if _is_service_message(sender if sender else None, msg.message or ""):
         return
 
     is_outgoing = 1 if getattr(msg, "out", False) else 0
@@ -634,13 +639,13 @@ async def _save_message(client: TelegramClient, msg: Message):
         pass
     dt_iso = dt.isoformat() if dt else ""
 
-    text = msg.message or ""
+    text = "" if light_mode else (msg.message or "")
 
     is_ephemeral = 1 if _ttl_seconds(msg) > 0 else 0
     media_path = None
-    media_type = _media_type(msg)
+    media_type = "" if light_mode else _media_type(msg)
 
-    if media_type and ((not is_ephemeral) or bool(s.get("download_ephemeral", True))):
+    if not light_mode and media_type and ((not is_ephemeral) or bool(s.get("download_ephemeral", True))):
         try:
             fname = f"{chat_id}_{msg.id}"
             media_path = await client.download_media(msg, file=os.path.join(media_folder(), fname))
