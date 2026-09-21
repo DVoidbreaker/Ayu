@@ -333,13 +333,7 @@ def main():
                     if not secret_ok:
                         _log(f"secret send failed chat={r.get('chat_id')} msg={r.get('msg_id')}")
 
-                all_ok = True
-                if has_primary and not primary_ok:
-                    all_ok = False
-                if has_secret and not secret_ok:
-                    all_ok = False
-
-                if all_ok:
+                if (has_primary and primary_ok) or (has_secret and secret_ok):
                     mark_sent(int(r.get("chat_id")), int(r.get("msg_id")))
 
         except Exception as e:
