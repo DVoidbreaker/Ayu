@@ -253,6 +253,7 @@ def _ensure_schema(account_name):
     dp = db_path()
     conn = sqlite3.connect(dp, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=10000;")
     conn.execute("""
     CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

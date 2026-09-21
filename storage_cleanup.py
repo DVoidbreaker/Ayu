@@ -232,7 +232,7 @@ def run_cleanup(settings, logger=None, force=False):
     conn = sqlite3.connect(db, timeout=20)
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA busy_timeout=6000;")
+        conn.execute("PRAGMA busy_timeout=10000;")
 
         rows_deleted, files_deleted = _cleanup_by_retention(conn, cfg["retention_days"])
         if rows_deleted or files_deleted:

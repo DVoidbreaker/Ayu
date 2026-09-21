@@ -453,6 +453,7 @@ def _build_runtime_session():
 def ensure_schema():
     conn = sqlite3.connect(db_path(), timeout=10)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=10000;")
     conn.execute("""
     CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -656,6 +657,7 @@ async def _save_message(client: TelegramClient, msg: Message):
 
     conn = sqlite3.connect(db_path(), timeout=10)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=10000;")
     cur = conn.cursor()
     cur.execute("""
         INSERT OR IGNORE INTO messages
@@ -700,6 +702,7 @@ async def _save_message(client: TelegramClient, msg: Message):
 async def _mark_deleted(chat_id: int, msg_id: int):
     conn = sqlite3.connect(db_path(), timeout=10)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=10000;")
     cur = conn.cursor()
     deleted_at = datetime.now(timezone.utc).isoformat()
     updated = 0
