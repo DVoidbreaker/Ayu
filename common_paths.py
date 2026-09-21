@@ -57,6 +57,12 @@ def log_dir():
     return d
 
 
+def notify_queue_dir():
+    d = os.path.join(account_dir(), "notify_queue")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def session_dir():
     d = os.path.join(tempfile.gettempdir(), "AuySoft", "anti_revoke", get_current_account() or "default")
     os.makedirs(d, exist_ok=True)

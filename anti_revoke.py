@@ -1,6 +1,6 @@
 # anti_revoke.py (exe-ready) - TTL fix (media.ttl_seconds)
 # Account-aware version: python anti_revoke.py <account_name>
-import os, json, sqlite3, traceback, shutil, sys, re
+import os, json, sqlite3, traceback, shutil, sys, re, time
 from datetime import datetime, timezone
 
 # --- account setup (must happen before any path imports) ---
@@ -8,7 +8,7 @@ if len(sys.argv) < 2:
     print("Usage: python anti_revoke.py <account_name>")
     sys.exit(1)
 
-from common_paths import set_account, db_path, settings_file, gui_cfg_file, media_folder, log_dir, session_base, legacy_session_base
+from common_paths import set_account, db_path, settings_file, gui_cfg_file, media_folder, log_dir, session_base, legacy_session_base, notify_queue_dir
 set_account(sys.argv[1])
 
 from telethon import TelegramClient, events
@@ -725,6 +725,18 @@ async def _mark_deleted(chat_id: int, msg_id: int):
         updated = int(cur.rowcount or 0)
     conn.commit()
     conn.close()
+    if updated <= 0:
+        return
+    row = _fetch_message_row(chat_id, msg_id)
+    if not row:
+        return
+    try:
+        qdir = notify_queue_dir()
+        fname = f"{int(time.time()*1000)}_{chat_id}_{msg_id}.json"
+        with open(os.path.join(qdir, fname), "w", encoding="utf-8") as f:
+            json.dump(row, f, ensure_ascii=False)
+    except Exception as e:
+        _log(f"queue write failed: {e}")
 
 async def main():
     print("[receiver] starting main()")

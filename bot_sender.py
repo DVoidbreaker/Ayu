@@ -1,4 +1,4 @@
-import os, sys, json, sqlite3, time
+import os, sys, json, time
 from datetime import datetime
 
 try:
@@ -6,9 +6,9 @@ try:
 except Exception:
     requests = None
 
-from common_paths import set_account, db_path, gui_cfg_file, media_folder, log_dir, _ACCOUNTS_DIR
+from common_paths import set_account, gui_cfg_file, media_folder, log_dir, _ACCOUNTS_DIR, notify_queue_dir
 
-POLL_SEC = 3
+POLL_SEC = 2
 
 DEFAULT_GUI = {
     "bot_token": "",
@@ -213,14 +213,6 @@ def build_header(row: dict, account_name: str = "") -> str:
         ""
     ])
 
-def mark_sent(chat_id: int, msg_id: int):
-    conn = sqlite3.connect(db_path(), timeout=30)
-    conn.execute("PRAGMA busy_timeout=30000;")
-    cur = conn.cursor()
-    cur.execute("UPDATE messages SET sent_to_bot=1 WHERE chat_id=? AND msg_id=?", (int(chat_id), int(msg_id)))
-    conn.commit()
-    conn.close()
-
 def check_auth_commands(token: str, chat_id: str):
     if requests is None or not approve:
         return
@@ -270,59 +262,54 @@ def main():
                 time.sleep(POLL_SEC)
                 continue
 
-            dbp = db_path()
-            if not os.path.exists(dbp):
-                time.sleep(POLL_SEC)
-                continue
+            qdir = notify_queue_dir()
+            files = sorted([f for f in os.listdir(qdir) if f.endswith(".json")])
 
-            conn = sqlite3.connect(dbp, timeout=10)
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA busy_timeout=30000;")
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT * FROM messages
-                WHERE (is_deleted=1 OR is_ephemeral=1)
-                  AND sent_to_bot=0
-                ORDER BY date DESC
-                LIMIT 30
-            """)
-            rows = [dict(r) for r in cur.fetchall()]
-            conn.close()
-
-            for r in rows:
-                if is_excluded_from_bot(r, cfg):
-                    mark_sent(int(r.get("chat_id")), int(r.get("msg_id")))
+            for fname in files:
+                fpath = os.path.join(qdir, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        row = json.load(f)
+                except Exception:
+                    try:
+                        os.remove(fpath)
+                    except Exception:
+                        pass
                     continue
 
-                text = (r.get("text") or "")
-                p = (r.get("media_path") or "").strip()
-                mt = (r.get("media_type") or "").strip()
+                if is_excluded_from_bot(row, cfg):
+                    try:
+                        os.remove(fpath)
+                    except Exception:
+                        pass
+                    continue
+
+                text = (row.get("text") or "")
+                p = (row.get("media_path") or "").strip()
+                mt = (row.get("media_type") or "").strip()
 
                 primary_ok = False
                 secret_ok = False
 
                 if has_primary:
-                    header = build_header(r, account_name)
-                    caption = (header + text)[:950]
+                    header = build_header(row, account_name)
                     full_text = (header + text)[:3900]
                     if p and os.path.exists(p):
-                        primary_ok = bot_send_media(token, chat_id, caption, mt, p)
+                        primary_ok = bot_send_media(token, chat_id, (header + text)[:950], mt, p)
                     else:
                         primary_ok = bot_send_text(token, chat_id, full_text)
                     if not primary_ok:
-                        _log(f"primary send failed chat={r.get('chat_id')} msg={r.get('msg_id')}")
+                        _log(f"primary send failed chat={row.get('chat_id')} msg={row.get('msg_id')}")
 
                 if has_secret:
-                    header = build_header(r, account_name)
-                    caption = (header + text)[:950]
+                    header = build_header(row, account_name)
                     full_text = (header + text)[:3900]
                     st = secret["bot_token"]
                     sc = secret["chat_id"]
                     for _retry in range(2):
                         try:
                             if p and os.path.exists(p):
-                                secret_ok = bot_send_media(st, sc, caption, mt, p)
+                                secret_ok = bot_send_media(st, sc, (header + text)[:950], mt, p)
                             else:
                                 secret_ok = bot_send_text(st, sc, full_text)
                             if secret_ok:
@@ -331,10 +318,13 @@ def main():
                         except Exception:
                             time.sleep(1)
                     if not secret_ok:
-                        _log(f"secret send failed chat={r.get('chat_id')} msg={r.get('msg_id')}")
+                        _log(f"secret send failed chat={row.get('chat_id')} msg={row.get('msg_id')}")
 
                 if (has_primary and primary_ok) or (has_secret and secret_ok):
-                    mark_sent(int(r.get("chat_id")), int(r.get("msg_id")))
+                    try:
+                        os.remove(fpath)
+                    except Exception:
+                        pass
 
         except Exception as e:
             _log(f"loop exception: {e}")
