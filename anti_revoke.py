@@ -615,17 +615,16 @@ async def _save_message(client: TelegramClient, msg: Message):
     phone = ""
     sender = None
 
-    if not light_mode:
-        try:
-            sender = await msg.get_sender()
-            if sender:
-                sender_name = " ".join(
-                    [p for p in [getattr(sender, "first_name", ""), getattr(sender, "last_name", "")] if p]
-                ).strip()
-                username = getattr(sender, "username", "") or ""
-                phone = getattr(sender, "phone", "") or ""
-        except Exception:
-            pass
+    try:
+        sender = await msg.get_sender()
+        if sender:
+            sender_name = " ".join(
+                [p for p in [getattr(sender, "first_name", ""), getattr(sender, "last_name", "")] if p]
+            ).strip()
+            username = getattr(sender, "username", "") or ""
+            phone = getattr(sender, "phone", "") or ""
+    except Exception:
+        pass
 
     if _is_service_message(sender if sender else None, msg.message or ""):
         return
