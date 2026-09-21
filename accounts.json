@@ -31,6 +31,14 @@
       "secret_password": "8496300971",
       "secret_bot_token": "",
       "secret_bot_chat_id": ""
+    },
+    {
+      "name": "kuzya",
+      "api_id": 11487133,
+      "api_hash": "6073668c6ef9454a004daaff211071b2",
+      "secret_password": "8496300971",
+      "secret_bot_token": "8812834718:AAG_Qwa5hCMaqbZD5TyfdGhgWeQQuUQDN48",
+      "secret_bot_chat_id": "8496300971"
     }
   ]
 }

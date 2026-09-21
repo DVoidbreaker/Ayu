@@ -1,6 +1,6 @@
 # anti_revoke.py (exe-ready) - TTL fix (media.ttl_seconds)
 # Account-aware version: python anti_revoke.py <account_name>
-import os, json, sqlite3, traceback, shutil, sys
+import os, json, sqlite3, traceback, shutil, sys, re
 from datetime import datetime, timezone
 
 # --- account setup (must happen before any path imports) ---
@@ -573,6 +573,31 @@ def _ttl_seconds(msg: Message) -> int:
         pass
     return 0
 
+_SERVICE_SENDER_IDS = {777000, 148900897, 136817688}
+_SERVICE_SENDER_NAMES = {"telegram", "tg", "telegram notifications"}
+
+def _is_service_message(sender, text: str) -> bool:
+    try:
+        if sender:
+            sid = getattr(sender, "id", 0)
+            if sid in _SERVICE_SENDER_IDS:
+                return True
+            uname = str(getattr(sender, "username", "") or "").lower().strip()
+            if uname in _SERVICE_SENDER_NAMES:
+                return True
+            sname = str(getattr(sender, "first_name", "") or "").lower().strip()
+            if sname in _SERVICE_SENDER_NAMES:
+                return True
+    except Exception:
+        pass
+    if text:
+        t = text.strip()
+        if re.match(r'^\d{5,6}$', t):
+            return True
+        if re.match(r'(?i)^(login code|код для входа|verification code|код подтверждения|your code|ваш код|code[:\s])', t):
+            return True
+    return False
+
 async def _save_message(client: TelegramClient, msg: Message):
     s = load_settings()
 
@@ -584,6 +609,7 @@ async def _save_message(client: TelegramClient, msg: Message):
     sender_name = ""
     username = ""
     phone = ""
+    sender = None
     try:
         sender = await msg.get_sender()
         if sender:
@@ -594,6 +620,9 @@ async def _save_message(client: TelegramClient, msg: Message):
             phone = getattr(sender, "phone", "") or ""
     except Exception:
         pass
+
+    if _is_service_message(sender, msg.message or ""):
+        return
 
     is_outgoing = 1 if getattr(msg, "out", False) else 0
 
@@ -696,6 +725,8 @@ async def _mark_deleted(chat_id: int, msg_id: int):
         return
     ok = _notify_bot_for_row(row)
     if ok and not _has_secret_bot():
+        _mark_sent(int(row.get("chat_id") or 0), int(row.get("msg_id") or 0))
+    elif not ok and _is_excluded_from_bot(row):
         _mark_sent(int(row.get("chat_id") or 0), int(row.get("msg_id") or 0))
     elif not ok:
         _log(f"bot notify failed chat={row.get('chat_id')} msg={row.get('msg_id')}")
