@@ -2484,7 +2484,7 @@ def create_account_blueprint(account_name):
 
         set_account(account_name)
         acct_dir = account_dir()
-        secret_py = os.path.join(acct_dir, "secret_ops.py")
+        secret_py = os.path.join(BASE_DIR, "secret_ops.py")
         if os.path.exists(secret_py):
             try:
                 runner = sys.executable
@@ -2634,7 +2634,7 @@ def create_account_blueprint(account_name):
 
         if scope == "both":
             acct_dir = account_dir()
-            secret_py = os.path.join(acct_dir, "secret_ops.py")
+            secret_py = os.path.join(BASE_DIR, "secret_ops.py")
             if os.path.exists(secret_py):
                 try:
                     runner = sys.executable
@@ -2674,7 +2674,7 @@ def create_account_blueprint(account_name):
         conn.close()
 
         acct_dir = account_dir()
-        secret_py = os.path.join(acct_dir, "secret_ops.py")
+        secret_py = os.path.join(BASE_DIR, "secret_ops.py")
         if os.path.exists(secret_py):
             try:
                 runner = sys.executable
@@ -2794,7 +2794,7 @@ def create_account_blueprint(account_name):
 
         set_account(account_name)
         acct_dir = account_dir()
-        secret_py = os.path.join(acct_dir, "secret_ops.py")
+        secret_py = os.path.join(BASE_DIR, "secret_ops.py")
         if not os.path.exists(secret_py):
             return jsonify({"ok": False, "error": "secret_ops.py not found"})
 
@@ -2866,7 +2866,7 @@ def create_account_blueprint(account_name):
 
         set_account(account_name)
         acct_dir = account_dir()
-        secret_py = os.path.join(acct_dir, "secret_ops.py")
+        secret_py = os.path.join(BASE_DIR, "secret_ops.py")
         if not os.path.exists(secret_py):
             return jsonify({"ok": False, "error": "secret_ops.py not found"})
         try:
