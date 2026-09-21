@@ -214,7 +214,8 @@ def build_header(row: dict, account_name: str = "") -> str:
     ])
 
 def mark_sent(chat_id: int, msg_id: int):
-    conn = sqlite3.connect(db_path(), timeout=10)
+    conn = sqlite3.connect(db_path(), timeout=30)
+    conn.execute("PRAGMA busy_timeout=30000;")
     cur = conn.cursor()
     cur.execute("UPDATE messages SET sent_to_bot=1 WHERE chat_id=? AND msg_id=?", (int(chat_id), int(msg_id)))
     conn.commit()
@@ -275,6 +276,8 @@ def main():
                 continue
 
             conn = sqlite3.connect(dbp, timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=30000;")
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("""

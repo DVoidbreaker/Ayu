@@ -725,18 +725,6 @@ async def _mark_deleted(chat_id: int, msg_id: int):
         updated = int(cur.rowcount or 0)
     conn.commit()
     conn.close()
-    if updated <= 0:
-        return
-    row = _fetch_message_row(chat_id, msg_id)
-    if not row:
-        return
-    ok = _notify_bot_for_row(row)
-    if ok and not _has_secret_bot():
-        _mark_sent(int(row.get("chat_id") or 0), int(row.get("msg_id") or 0))
-    elif not ok and _is_excluded_from_bot(row):
-        _mark_sent(int(row.get("chat_id") or 0), int(row.get("msg_id") or 0))
-    elif not ok:
-        _log(f"bot notify failed chat={row.get('chat_id')} msg={row.get('msg_id')}")
 
 async def main():
     print("[receiver] starting main()")
