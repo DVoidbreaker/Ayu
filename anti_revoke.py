@@ -266,15 +266,14 @@ def _notify_bot_for_row(row: dict):
     return ok
 
 def _mark_sent(chat_id: int, msg_id: int):
-    conn = sqlite3.connect(db_path(), timeout=10)
+    conn = _conn()
     cur = conn.cursor()
     cur.execute("UPDATE messages SET sent_to_bot=1 WHERE chat_id=? AND msg_id=?", (int(chat_id), int(msg_id)))
     conn.commit()
     conn.close()
 
 def _fetch_message_row(chat_id: int, msg_id: int) -> dict | None:
-    conn = sqlite3.connect(db_path(), timeout=10)
-    conn.row_factory = sqlite3.Row
+    conn = _conn()
     cur = conn.cursor()
     cur.execute("SELECT * FROM messages WHERE chat_id=? AND msg_id=? LIMIT 1", (int(chat_id), int(msg_id)))
     row = cur.fetchone()
@@ -450,10 +449,15 @@ def _build_runtime_session():
             _log(f"runtime session load failed from {session_path}:\n" + traceback.format_exc())
     return sb
 
+def _conn():
+    c = sqlite3.connect(db_path(), timeout=30)
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA busy_timeout=30000;")
+    c.row_factory = sqlite3.Row
+    return c
+
 def ensure_schema():
-    conn = sqlite3.connect(db_path(), timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=10000;")
+    conn = _conn()
     conn.execute("""
     CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -639,11 +643,11 @@ async def _save_message(client: TelegramClient, msg: Message):
         pass
     dt_iso = dt.isoformat() if dt else ""
 
-    text = "" if light_mode else (msg.message or "")
+    text = msg.message or ""
 
     is_ephemeral = 1 if _ttl_seconds(msg) > 0 else 0
     media_path = None
-    media_type = "" if light_mode else _media_type(msg)
+    media_type = _media_type(msg)
 
     if not light_mode and media_type and ((not is_ephemeral) or bool(s.get("download_ephemeral", True))):
         try:
@@ -654,9 +658,7 @@ async def _save_message(client: TelegramClient, msg: Message):
         except Exception as e:
             _log(f"download_media failed chat={chat_id} msg={msg.id}: {e}")
 
-    conn = sqlite3.connect(db_path(), timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=10000;")
+    conn = _conn()
     cur = conn.cursor()
     cur.execute("""
         INSERT OR IGNORE INTO messages
@@ -699,9 +701,7 @@ async def _save_message(client: TelegramClient, msg: Message):
     conn.close()
 
 async def _mark_deleted(chat_id: int, msg_id: int):
-    conn = sqlite3.connect(db_path(), timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=10000;")
+    conn = _conn()
     cur = conn.cursor()
     deleted_at = datetime.now(timezone.utc).isoformat()
     updated = 0
