@@ -350,6 +350,67 @@ async def cmd_edit(account_name, chat_id, msg_id, text):
             except Exception:
                 pass
 
+async def cmd_dialogs(account_name, limit=100):
+    api_id, api_hash = _load_api_creds(account_name)
+    if not api_id or not api_hash:
+        print(json.dumps({"ok": False, "error": "API credentials not found"}))
+        return
+    _bootstrap_session(account_name)
+    client = None
+    try:
+        from telethon import TelegramClient
+        client = TelegramClient(_session_base(account_name), api_id, api_hash)
+        await client.start()
+        me = await client.get_me()
+        my_id = me.id if me else 0
+        dialogs = []
+        async for dialog in client.iter_dialogs(limit=int(limit)):
+            ent = dialog.entity
+            cid = getattr(ent, "id", 0)
+            title = dialog.name or str(cid)
+            ctype = "private"
+            if hasattr(ent, "megagroup"):
+                ctype = "group" if ent.megagroup else "channel"
+            elif hasattr(ent, "title") and not hasattr(ent, "first_name"):
+                ctype = "channel"
+            uname = getattr(ent, "username", "") or ""
+            last_msg = dialog.message
+            last_text = ""
+            last_date = ""
+            last_outgoing = False
+            if last_msg:
+                last_text = getattr(last_msg, "message", "") or ""
+                dt = getattr(last_msg, "date", None)
+                if dt:
+                    try:
+                        from datetime import timezone
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        pass
+                    last_date = dt.isoformat() if dt else ""
+                last_outgoing = bool(getattr(last_msg, "out", False))
+            unread = dialog.unread_count or 0
+            dialogs.append({
+                "chat_id": cid,
+                "title": title,
+                "chat_type": ctype,
+                "username": uname,
+                "last_text": last_text,
+                "last_date": last_date,
+                "last_outgoing": last_outgoing,
+                "unread": unread,
+            })
+        print(json.dumps({"ok": True, "dialogs": dialogs, "my_id": my_id}))
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+    finally:
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
 def _detect_account():
     cwd = os.getcwd()
     if os.path.basename(os.path.dirname(cwd)) == "accounts":
@@ -422,6 +483,13 @@ def main():
             elif args[i] == "--text" and i+1 < len(args):
                 text = args[i+1]
         asyncio.run(cmd_edit(account_name, chat_id, msg_id, text))
+    elif command == "dialogs":
+        limit = 100
+        args = sys.argv[2:]
+        for i in range(0, len(args), 2):
+            if args[i] == "--limit" and i+1 < len(args):
+                limit = int(args[i+1])
+        asyncio.run(cmd_dialogs(account_name, limit))
     else:
         print(json.dumps({"ok": False, "error": f"Unknown command: {command}"}))
 

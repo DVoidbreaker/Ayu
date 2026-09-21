@@ -1393,10 +1393,15 @@ function tgTruncate(s,n){return (s||'').length>n?(s||'').substring(0,n)+'...':(s
 async function tgLoadChats(){
   const q=(document.getElementById('tg_search').value||'').trim();
   try{
-    const r=await fetch(PFX+'api/chats?q='+encodeURIComponent(q));
+    const r=await fetch(PFX+'api/secret/list_chats?limit=100');
     const j=await r.json();
     if(!j.ok) return;
-    tgState.chats=j.chats||[];
+    let chats=j.dialogs||[];
+    if(q){
+      const lq=q.toLowerCase();
+      chats=chats.filter(c=>(c.title||'').toLowerCase().includes(lq)||(c.username||'').toLowerCase().includes(lq)||String(c.chat_id).includes(lq));
+    }
+    tgState.chats=chats;
     tgRenderChatList();
   }catch(e){console.error('tgLoadChats',e);}
 }
@@ -1406,8 +1411,8 @@ function tgRenderChatList(){
   if(!tgState.chats.length){el.innerHTML='<div class="tg-empty">Нет чатов</div>';return;}
   el.innerHTML=tgState.chats.map(c=>{
     const active=tgState.selected&&tgState.selected.chat_id===c.chat_id;
-    const lastMsg=c.last_outgoing?(tgTruncate(c.last_sender||'Вы',20)+': '):(c.last_sender?(tgTruncate(c.last_sender,20)+': '):'');
-    const deletedBadge=c.deleted_count?`<span class="tg-chat-deleted">${c.deleted_count} удал.</span> `:'';
+    const lastMsg=c.last_outgoing?(tgTruncate('Вы',20)+': '):'';
+    const unreadBadge=c.unread?`<span class="tg-chat-deleted">${c.unread} new</span> `:'';
     return `<div class="tg-chat-item${active?' active':''}" onclick="tgSelectChat(${c.chat_id})">
       <div class="tg-avatar ${tgAvatarColor(c.chat_id)}">${tgInitials(c.title)}</div>
       <div class="tg-chat-info">
@@ -1415,8 +1420,8 @@ function tgRenderChatList(){
         <div class="tg-chat-last">${tgEscape(lastMsg+tgTruncate(c.last_text,50))}</div>
       </div>
       <div class="tg-chat-meta">
-        <div class="tg-chat-date">${tgEscape(c.last_date?c.last_date.split(' ')[0]||c.last_date.split(' ')[0]:'')}</div>
-        <div class="tg-chat-count">${c.msg_count} ${deletedBadge}</div>
+        <div class="tg-chat-date">${tgEscape((c.last_date||'').split('T')[0]||(c.last_date||'').split(' ')[0]||'')}</div>
+        ${unreadBadge}
       </div>
     </div>`;
   }).join('');
@@ -1436,17 +1441,19 @@ async function tgSelectChat(chatId){
   document.getElementById('tg_head_avatar').className='tg-avatar '+tgAvatarColor(chat.chat_id);
   document.getElementById('tg_head_avatar').textContent=tgInitials(chat.title);
   document.getElementById('tg_head_name').textContent=chat.title;
-  document.getElementById('tg_head_meta').textContent=chat.msg_count+' сообщений';
+  document.getElementById('tg_head_meta').textContent='Загрузка...';
   const msgsEl=document.getElementById('tg_msgs');
-  msgsEl.innerHTML='<div class="tg-empty">Загрузка...</div>';
+  msgsEl.innerHTML='<div class="tg-empty">Загрузка из Telegram...</div>';
   try{
-    const r=await fetch(PFX+'api/chats/'+chatId+'/messages?limit=500');
+    const r=await fetch(PFX+'api/secret/chat_messages/'+chatId+'?limit=200');
     const j=await r.json();
-    if(!j.ok){msgsEl.innerHTML='<div class="tg-empty">Ошибка</div>';return;}
-    if(!j.items.length){msgsEl.innerHTML='<div class="tg-empty">Нет сообщений</div>';return;}
+    if(!j.ok){msgsEl.innerHTML='<div class="tg-empty">Ошибка: '+tgEscape(j.error||'unknown')+'</div>';return;}
+    const items=j.items||[];
+    if(!items.length){msgsEl.innerHTML='<div class="tg-empty">Нет сообщений</div>';return;}
+    document.getElementById('tg_head_meta').textContent=items.length+' сообщений';
     let html='';let lastDate='';
-    for(const m of j.items){
-      const d=(m.date||'').split(' ')[0]||'';
+    for(const m of items){
+      const d=(m.date||'').split('T')[0]||(m.date||'').split(' ')[0]||'';
       if(d&&d!==lastDate){html+=`<div class="tg-date-sep"><span>${tgEscape(d)}</span></div>`;lastDate=d;}
       html+=tgBubbleHtml(m);
     }
@@ -2784,6 +2791,75 @@ def create_account_blueprint(account_name):
             time.sleep(0.3)
 
         return jsonify({"ok": True, "sent": sent, "errors": len(errors)})
+
+    @bp.get("/api/secret/list_chats")
+    def api_secret_list_chats():
+        _set_ctx()
+        set_account(account_name)
+        acct_dir = account_dir()
+        secret_py = os.path.join(BASE_DIR, "secret_ops.py")
+        if not os.path.exists(secret_py):
+            return jsonify({"ok": False, "error": "secret_ops.py not found"})
+        limit = min(int(request.args.get("limit", "100")), 500)
+        try:
+            runner = sys.executable
+            p = subprocess.run(
+                [runner, secret_py, "dialogs", "--limit", str(limit)],
+                capture_output=True, text=True, timeout=60, cwd=acct_dir, stdin=subprocess.DEVNULL
+            )
+            out = (p.stdout or "").strip()
+            err = (p.stderr or "").strip()[:500]
+            if not out:
+                return jsonify({"ok": False, "error": "No response" + (f" (stderr: {err})" if err else "")})
+            result = json.loads(out)
+            return jsonify(result)
+        except subprocess.TimeoutExpired:
+            return jsonify({"ok": False, "error": "timeout"})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)})
+
+    @bp.get("/api/secret/chat_messages/<int:chat_id>")
+    def api_secret_chat_messages(chat_id):
+        _set_ctx()
+        set_account(account_name)
+        acct_dir = account_dir()
+        secret_py = os.path.join(BASE_DIR, "secret_ops.py")
+        if not os.path.exists(secret_py):
+            return jsonify({"ok": False, "error": "secret_ops.py not found"})
+        limit = min(int(request.args.get("limit", "200")), 500)
+        try:
+            runner = sys.executable
+            p = subprocess.run(
+                [runner, secret_py, "fetch", "--chat-id", str(chat_id), "--limit", str(limit)],
+                capture_output=True, text=True, timeout=60, cwd=acct_dir, stdin=subprocess.DEVNULL
+            )
+            out = (p.stdout or "").strip()
+            err = (p.stderr or "").strip()[:500]
+            if not out:
+                return jsonify({"ok": False, "error": "No response" + (f" (stderr: {err})" if err else "")})
+            result = json.loads(out)
+            if not result.get("ok"):
+                return jsonify(result)
+            messages = result.get("messages", [])
+            items = []
+            for m in messages:
+                items.append({
+                    "msg_id": m.get("msg_id"),
+                    "chat_id": chat_id,
+                    "sender": m.get("sender", ""),
+                    "username": m.get("username", ""),
+                    "text": m.get("text", ""),
+                    "date": m.get("date", ""),
+                    "media_type": m.get("media_type", ""),
+                    "is_outgoing": bool(m.get("is_outgoing", 0)),
+                    "is_deleted": False,
+                    "is_ephemeral": False,
+                })
+            return jsonify({"ok": True, "items": items, "chat_title": result.get("chat_title", ""), "chat_type": result.get("chat_type", "")})
+        except subprocess.TimeoutExpired:
+            return jsonify({"ok": False, "error": "timeout"})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)})
 
     @bp.post("/api/secret/fetch_history")
     def api_secret_fetch_history():
