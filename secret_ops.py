@@ -350,21 +350,36 @@ async def cmd_edit(account_name, chat_id, msg_id, text):
             except Exception:
                 pass
 
+def _detect_account():
+    cwd = os.getcwd()
+    if os.path.basename(os.path.dirname(cwd)) == "accounts":
+        return os.path.basename(cwd)
+    parent = os.path.dirname(cwd)
+    if os.path.exists(os.path.join(parent, "accounts.json")):
+        for name in os.listdir(os.path.join(parent, "accounts")):
+            if os.path.abspath(os.path.join(cwd)) == os.path.abspath(os.path.join(parent, "accounts", name)):
+                return name
+    return None
+
 def main():
-    if len(sys.argv) < 3:
-        print(json.dumps({"ok": False, "error": "Usage: python secret_ops.py <account> <command> [args]"}))
+    account_name = _detect_account()
+    if not account_name:
+        print(json.dumps({"ok": False, "error": "Cannot detect account from cwd"}))
         sys.exit(1)
 
-    account_name = sys.argv[1]
-    command = sys.argv[2]
+    if len(sys.argv) < 2:
+        print(json.dumps({"ok": False, "error": "Usage: python secret_ops.py <command> [args]"}))
+        sys.exit(1)
+
+    command = sys.argv[1]
 
     if command == "resolve":
-        identifier = sys.argv[3] if len(sys.argv) > 3 else ""
+        identifier = sys.argv[2] if len(sys.argv) > 2 else ""
         asyncio.run(cmd_resolve(account_name, identifier))
     elif command == "fetch":
         chat_id = 0
         limit = 5000
-        args = sys.argv[3:]
+        args = sys.argv[2:]
         for i in range(0, len(args), 2):
             if args[i] == "--chat-id" and i+1 < len(args):
                 chat_id = int(args[i+1])
@@ -374,7 +389,7 @@ def main():
     elif command == "download":
         chat_id = 0
         msg_ids = ""
-        args = sys.argv[3:]
+        args = sys.argv[2:]
         for i in range(0, len(args), 2):
             if args[i] == "--chat-id" and i+1 < len(args):
                 chat_id = int(args[i+1])
@@ -385,7 +400,7 @@ def main():
         chat_id = 0
         msg_ids = ""
         revoke = False
-        args = sys.argv[3:]
+        args = sys.argv[2:]
         for i in range(0, len(args), 2):
             if args[i] == "--chat-id" and i+1 < len(args):
                 chat_id = int(args[i+1])
@@ -398,7 +413,7 @@ def main():
         chat_id = 0
         msg_id = 0
         text = ""
-        args = sys.argv[3:]
+        args = sys.argv[2:]
         for i in range(0, len(args), 2):
             if args[i] == "--chat-id" and i+1 < len(args):
                 chat_id = int(args[i+1])
