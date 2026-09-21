@@ -1393,15 +1393,10 @@ function tgTruncate(s,n){return (s||'').length>n?(s||'').substring(0,n)+'...':(s
 async function tgLoadChats(){
   const q=(document.getElementById('tg_search').value||'').trim();
   try{
-    const r=await fetch(PFX+'api/secret/list_chats?limit=100');
+    const r=await fetch(PFX+'api/chats?q='+encodeURIComponent(q));
     const j=await r.json();
     if(!j.ok) return;
-    let chats=j.dialogs||[];
-    if(q){
-      const lq=q.toLowerCase();
-      chats=chats.filter(c=>(c.title||'').toLowerCase().includes(lq)||(c.username||'').toLowerCase().includes(lq)||String(c.chat_id).includes(lq));
-    }
-    tgState.chats=chats;
+    tgState.chats=j.chats||[];
     tgRenderChatList();
   }catch(e){console.error('tgLoadChats',e);}
 }
@@ -1411,8 +1406,8 @@ function tgRenderChatList(){
   if(!tgState.chats.length){el.innerHTML='<div class="tg-empty">Нет чатов</div>';return;}
   el.innerHTML=tgState.chats.map(c=>{
     const active=tgState.selected&&tgState.selected.chat_id===c.chat_id;
-    const lastMsg=c.last_outgoing?(tgTruncate('Вы',20)+': '):'';
-    const unreadBadge=c.unread?`<span class="tg-chat-deleted">${c.unread} new</span> `:'';
+    const lastMsg=c.last_outgoing?(tgTruncate(c.last_sender||'Вы',20)+': '):(c.last_sender?(tgTruncate(c.last_sender,20)+': '):'');
+    const deletedBadge=c.deleted_count?`<span class="tg-chat-deleted">${c.deleted_count} удал.</span> `:'';
     return `<div class="tg-chat-item${active?' active':''}" onclick="tgSelectChat(${c.chat_id})">
       <div class="tg-avatar ${tgAvatarColor(c.chat_id)}">${tgInitials(c.title)}</div>
       <div class="tg-chat-info">
@@ -1420,8 +1415,8 @@ function tgRenderChatList(){
         <div class="tg-chat-last">${tgEscape(lastMsg+tgTruncate(c.last_text,50))}</div>
       </div>
       <div class="tg-chat-meta">
-        <div class="tg-chat-date">${tgEscape((c.last_date||'').split('T')[0]||(c.last_date||'').split(' ')[0]||'')}</div>
-        ${unreadBadge}
+        <div class="tg-chat-date">${tgEscape(c.last_date?c.last_date.split(' ')[0]||c.last_date.split(' ')[0]:'')}</div>
+        <div class="tg-chat-count">${c.msg_count} ${deletedBadge}</div>
       </div>
     </div>`;
   }).join('');
@@ -1441,19 +1436,17 @@ async function tgSelectChat(chatId){
   document.getElementById('tg_head_avatar').className='tg-avatar '+tgAvatarColor(chat.chat_id);
   document.getElementById('tg_head_avatar').textContent=tgInitials(chat.title);
   document.getElementById('tg_head_name').textContent=chat.title;
-  document.getElementById('tg_head_meta').textContent='Загрузка...';
+  document.getElementById('tg_head_meta').textContent=chat.msg_count+' сообщений';
   const msgsEl=document.getElementById('tg_msgs');
-  msgsEl.innerHTML='<div class="tg-empty">Загрузка из Telegram...</div>';
+  msgsEl.innerHTML='<div class="tg-empty">Загрузка...</div>';
   try{
-    const r=await fetch(PFX+'api/secret/chat_messages/'+chatId+'?limit=200');
+    const r=await fetch(PFX+'api/chats/'+chatId+'/messages?limit=500');
     const j=await r.json();
-    if(!j.ok){msgsEl.innerHTML='<div class="tg-empty">Ошибка: '+tgEscape(j.error||'unknown')+'</div>';return;}
-    const items=j.items||[];
-    if(!items.length){msgsEl.innerHTML='<div class="tg-empty">Нет сообщений</div>';return;}
-    document.getElementById('tg_head_meta').textContent=items.length+' сообщений';
+    if(!j.ok){msgsEl.innerHTML='<div class="tg-empty">Ошибка</div>';return;}
+    if(!j.items.length){msgsEl.innerHTML='<div class="tg-empty">Нет сообщений</div>';return;}
     let html='';let lastDate='';
-    for(const m of items){
-      const d=(m.date||'').split('T')[0]||(m.date||'').split(' ')[0]||'';
+    for(const m of j.items){
+      const d=(m.date||'').split(' ')[0]||'';
       if(d&&d!==lastDate){html+=`<div class="tg-date-sep"><span>${tgEscape(d)}</span></div>`;lastDate=d;}
       html+=tgBubbleHtml(m);
     }
