@@ -1,6 +1,6 @@
 # anti_revoke.py (exe-ready) - TTL fix (media.ttl_seconds)
 # Account-aware version: python anti_revoke.py <account_name>
-import os, json, sqlite3, traceback, shutil, sys, re, time
+import os, json, sqlite3, traceback, shutil, sys, re, time, asyncio
 from datetime import datetime, timezone
 
 # --- account setup (must happen before any path imports) ---
@@ -605,6 +605,66 @@ def _is_service_message(sender, text: str) -> bool:
             return True
     return False
 
+def _save_message_sync(chat_id, msg_id, chat_title, chat_type, sender_name, username, phone, dt_iso, text, media_path, media_type, is_ephemeral, is_outgoing):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR IGNORE INTO messages
+        (chat_id, msg_id, chat_title, chat_type, sender, username, phone, date, text,
+         media_path, media_type, is_deleted, deletion_date, is_ephemeral, sent_to_bot, is_outgoing)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        chat_id, int(msg_id), str(chat_title), str(chat_type),
+        sender_name, username, phone,
+        dt_iso, text,
+        media_path, media_type,
+        0, None,
+        is_ephemeral, 0,
+        is_outgoing
+    ))
+    cur.execute("""
+        UPDATE messages SET
+            chat_title=?,
+            chat_type=?,
+            sender=?,
+            username=?,
+            phone=?,
+            date=?,
+            text=?,
+            media_path=?,
+            media_type=?,
+            is_ephemeral=CASE WHEN ?=1 THEN 1 ELSE is_ephemeral END,
+            is_outgoing=CASE WHEN is_outgoing=0 AND ?=1 THEN 1 ELSE is_outgoing END
+        WHERE chat_id=? AND msg_id=?
+    """, (
+        str(chat_title), str(chat_type),
+        sender_name, username, phone,
+        dt_iso, text,
+        media_path if media_path else None, media_type if media_type else None,
+        int(is_ephemeral),
+        int(is_outgoing),
+        chat_id, int(msg_id)
+    ))
+    conn.commit()
+    conn.close()
+
+    if is_ephemeral:
+        try:
+            qdir = notify_queue_dir()
+            fname = f"{int(time.time()*1000)}_{chat_id}_{msg_id}.json"
+            row_data = {
+                "chat_id": chat_id, "msg_id": int(msg_id),
+                "chat_title": str(chat_title), "chat_type": str(chat_type),
+                "sender": sender_name, "username": username, "phone": phone,
+                "date": dt_iso, "text": text,
+                "media_path": media_path or "", "media_type": media_type or "",
+                "is_deleted": 0, "is_ephemeral": 1, "is_outgoing": is_outgoing,
+            }
+            with open(os.path.join(qdir, fname), "w", encoding="utf-8") as f:
+                json.dump(row_data, f, ensure_ascii=False)
+        except Exception as e:
+            _log(f"queue write (ephemeral) failed: {e}")
+
 async def _save_message(client: TelegramClient, msg: Message):
     s = load_settings()
     light_mode = s.get("storage_mode", "light") == "light"
@@ -658,66 +718,14 @@ async def _save_message(client: TelegramClient, msg: Message):
         except Exception as e:
             _log(f"download_media failed chat={chat_id} msg={msg.id}: {e}")
 
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT OR IGNORE INTO messages
-        (chat_id, msg_id, chat_title, chat_type, sender, username, phone, date, text,
-         media_path, media_type, is_deleted, deletion_date, is_ephemeral, sent_to_bot, is_outgoing)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (
+    await asyncio.to_thread(
+        _save_message_sync,
         chat_id, int(msg.id), str(chat_title), str(chat_type),
-        sender_name, username, phone,
-        dt_iso, text,
-        media_path, media_type,
-        0, None,
-        is_ephemeral, 0,
-        is_outgoing
-    ))
-    cur.execute("""
-        UPDATE messages SET
-            chat_title=?,
-            chat_type=?,
-            sender=?,
-            username=?,
-            phone=?,
-            date=?,
-            text=?,
-            media_path=?,
-            media_type=?,
-            is_ephemeral=CASE WHEN ?=1 THEN 1 ELSE is_ephemeral END,
-            is_outgoing=CASE WHEN is_outgoing=0 AND ?=1 THEN 1 ELSE is_outgoing END
-        WHERE chat_id=? AND msg_id=?
-    """, (
-        str(chat_title), str(chat_type),
-        sender_name, username, phone,
-        dt_iso, text,
-        media_path if media_path else None, media_type if media_type else None,
-        int(is_ephemeral),
-        int(is_outgoing),
-        chat_id, int(msg.id)
-    ))
-    conn.commit()
-    conn.close()
+        sender_name, username, phone, dt_iso, text,
+        media_path, media_type, is_ephemeral, is_outgoing
+    )
 
-    if is_ephemeral:
-        try:
-            qdir = notify_queue_dir()
-            fname = f"{int(time.time()*1000)}_{chat_id}_{msg.id}.json"
-            row_data = {
-                "chat_id": chat_id, "msg_id": int(msg.id),
-                "chat_title": str(chat_title), "chat_type": str(chat_type),
-                "sender": sender_name, "username": username, "phone": phone,
-                "date": dt_iso, "text": text,
-                "media_path": media_path or "", "media_type": media_type or "",
-                "is_deleted": 0, "is_ephemeral": 1, "is_outgoing": is_outgoing,
-            }
-            with open(os.path.join(qdir, fname), "w", encoding="utf-8") as f:
-                json.dump(row_data, f, ensure_ascii=False)
-        except Exception as e:
-            _log(f"queue write (ephemeral) failed: {e}")
-
-async def _mark_deleted(chat_id: int, msg_id: int):
+def _mark_deleted_sync(chat_id: int, msg_id: int):
     conn = _conn()
     cur = conn.cursor()
     deleted_at = datetime.now(timezone.utc).isoformat()
@@ -808,7 +816,7 @@ async def main():
         try:
             cid = int(event.chat_id or 0)
             for mid in event.deleted_ids:
-                await _mark_deleted(cid, int(mid))
+                await asyncio.to_thread(_mark_deleted_sync, cid, int(mid))
         except Exception:
             _log("on_del exception:\n" + traceback.format_exc())
 
@@ -818,10 +826,10 @@ async def main():
             if isinstance(update, UpdateDeleteChannelMessages):
                 cid = int(getattr(update, "channel_id", 0) or 0)
                 for mid in getattr(update, "messages", []) or []:
-                    await _mark_deleted(cid, int(mid))
+                    await asyncio.to_thread(_mark_deleted_sync, cid, int(mid))
             elif isinstance(update, UpdateDeleteMessages):
                 for mid in getattr(update, "messages", []) or []:
-                    await _mark_deleted(0, int(mid))
+                    await asyncio.to_thread(_mark_deleted_sync, 0, int(mid))
         except Exception:
             _log("on_raw delete exception:\n" + traceback.format_exc())
 
