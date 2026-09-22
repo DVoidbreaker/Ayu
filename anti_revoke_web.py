@@ -1482,6 +1482,9 @@ function tgBubbleHtml(m){
     }else{
       media=`<div class="tg-bubble-media"><a class="media-link" href="${url}" target="_blank">📎 ${tgEscape(m.media)}</a></div>`;
     }
+  }else if(m.media_type){
+    const icons={photo:'🖼 Фото',video:'🎬 Видео',voice:'🎤 Голос',video_note:'⭕ Видеосообщение',audio:'🎵 Аудио',document:'📄 Файл'};
+    media=`<div class="tg-bubble-media"><span style="color:var(--muted)">${icons[m.media_type]||('📎 '+tgEscape(m.media_type))}</span></div>`;
   }
   return `<div style="display:flex;justify-content:${m.is_outgoing?'flex-end':'flex-start'}">
     <div class="tg-bubble ${cls}">${sender}${tgEscape(m.text)||'<span style="color:var(--muted)">—</span>'}${media}${tags}<div class="time">${tgEscape(time)}</div></div>
