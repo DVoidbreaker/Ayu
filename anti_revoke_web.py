@@ -2914,6 +2914,21 @@ def create_account_blueprint(account_name):
                 ))
                 if cur.rowcount:
                     saved += 1
+                cur.execute("""
+                    UPDATE messages SET
+                        text=CASE WHEN text='' OR text IS NULL THEN ? ELSE text END,
+                        sender=CASE WHEN sender='' OR sender IS NULL THEN ? ELSE sender END,
+                        username=CASE WHEN username='' OR username IS NULL THEN ? ELSE username END,
+                        media_type=CASE WHEN (media_type='' OR media_type IS NULL) AND ? IS NOT NULL THEN ? ELSE media_type END,
+                        chat_title=CASE WHEN chat_title='' OR chat_title IS NULL THEN ? ELSE chat_title END,
+                        phone=CASE WHEN phone='' OR phone IS NULL THEN ? ELSE phone END
+                    WHERE chat_id=? AND msg_id=?
+                """, (
+                    text_m, sender_m, username_m,
+                    media_type_m, media_type_m,
+                    chat_title, "",
+                    int(chat_id), int(msg_id_m)
+                ))
             conn.commit()
             conn.close()
             return jsonify({"ok": True, "count": len(messages), "saved": saved})
@@ -2959,6 +2974,33 @@ def create_account_blueprint(account_name):
             return jsonify({"ok": True, "media": result.get("media", ""), "media_path": media_path})
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)})
+
+    @bp.post("/api/secret/purge_empty")
+    def api_purge_empty():
+        _set_ctx()
+        set_account(account_name)
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM messages WHERE (text='' OR text IS NULL) AND (media_type='' OR media_type IS NULL) AND (media_path='' OR media_path IS NULL)")
+        deleted = cur.rowcount
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True, "deleted": deleted})
+
+    @bp.get("/api/secret/empty_stats")
+    def api_empty_stats():
+        _set_ctx()
+        set_account(account_name)
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM messages")
+        total = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM messages WHERE (text='' OR text IS NULL)")
+        empty = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM messages WHERE is_ephemeral=1 AND sent_to_bot=0")
+        pending_ttl = cur.fetchone()[0]
+        conn.close()
+        return jsonify({"ok": True, "total": total, "empty": empty, "pending_ttl": pending_ttl})
 
     return bp
 
