@@ -676,29 +676,40 @@ async def _save_message(client: TelegramClient, msg: Message):
     ))
     cur.execute("""
         UPDATE messages SET
-            chat_title=COALESCE(?, chat_title),
-            chat_type=COALESCE(?, chat_type),
-            sender=COALESCE(?, sender),
-            username=COALESCE(?, username),
-            phone=COALESCE(?, phone),
-            date=COALESCE(?, date),
-            text=COALESCE(?, text),
-            media_path=COALESCE(?, media_path),
-            media_type=COALESCE(?, media_type),
+            chat_title=?,
+            chat_type=?,
+            sender=?,
+            username=?,
+            phone=?,
+            date=?,
+            text=?,
+            media_path=?,
+            media_type=?,
             is_ephemeral=CASE WHEN ?=1 THEN 1 ELSE is_ephemeral END,
             is_outgoing=CASE WHEN is_outgoing=0 AND ?=1 THEN 1 ELSE is_outgoing END
         WHERE chat_id=? AND msg_id=?
     """, (
         str(chat_title), str(chat_type),
-        sender_name or None, username or None, phone or None,
-        dt_iso or None, text or None,
-        media_path or None, media_type or None,
+        sender_name, username, phone,
+        dt_iso, text,
+        media_path if media_path else None, media_type if media_type else None,
         int(is_ephemeral),
         int(is_outgoing),
         chat_id, int(msg.id)
     ))
     conn.commit()
     conn.close()
+
+    if is_ephemeral:
+        try:
+            row = _fetch_message_row(chat_id, int(msg.id))
+            if row:
+                qdir = notify_queue_dir()
+                fname = f"{int(time.time()*1000)}_{chat_id}_{msg.id}.json"
+                with open(os.path.join(qdir, fname), "w", encoding="utf-8") as f:
+                    json.dump(row, f, ensure_ascii=False)
+        except Exception as e:
+            _log(f"queue write (ephemeral) failed: {e}")
 
 async def _mark_deleted(chat_id: int, msg_id: int):
     conn = _conn()
