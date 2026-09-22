@@ -8,7 +8,7 @@ if len(sys.argv) < 2:
     print("Usage: python anti_revoke.py <account_name>")
     sys.exit(1)
 
-from common_paths import set_account, db_path, settings_file, gui_cfg_file, media_folder, log_dir, session_base, legacy_session_base, notify_queue_dir
+from common_paths import set_account, db_path, settings_file, gui_cfg_file, media_folder, log_dir, session_base, legacy_session_base
 set_account(sys.argv[1])
 
 from telethon import TelegramClient, events
@@ -648,23 +648,6 @@ def _save_message_sync(chat_id, msg_id, chat_title, chat_type, sender_name, user
     conn.commit()
     conn.close()
 
-    if is_ephemeral:
-        try:
-            qdir = notify_queue_dir()
-            fname = f"{int(time.time()*1000)}_{chat_id}_{msg_id}.json"
-            row_data = {
-                "chat_id": chat_id, "msg_id": int(msg_id),
-                "chat_title": str(chat_title), "chat_type": str(chat_type),
-                "sender": sender_name, "username": username, "phone": phone,
-                "date": dt_iso, "text": text,
-                "media_path": media_path or "", "media_type": media_type or "",
-                "is_deleted": 0, "is_ephemeral": 1, "is_outgoing": is_outgoing,
-            }
-            with open(os.path.join(qdir, fname), "w", encoding="utf-8") as f:
-                json.dump(row_data, f, ensure_ascii=False)
-        except Exception as e:
-            _log(f"queue write (ephemeral) failed: {e}")
-
 async def _save_message(client: TelegramClient, msg: Message):
     s = load_settings()
     light_mode = s.get("storage_mode", "light") == "light"
@@ -729,44 +712,23 @@ def _mark_deleted_sync(chat_id: int, msg_id: int):
     conn = _conn()
     cur = conn.cursor()
     deleted_at = datetime.now(timezone.utc).isoformat()
-    updated = 0
     if chat_id:
         cur.execute("""
             UPDATE messages SET is_deleted=1, deletion_date=?
             WHERE chat_id=? AND msg_id=? AND is_deleted=0
         """, (deleted_at, int(chat_id), int(msg_id)))
-        updated = int(cur.rowcount or 0)
-        if updated == 0:
+        if cur.rowcount == 0:
             cur.execute("""
                 UPDATE messages SET is_deleted=1, deletion_date=?
                 WHERE msg_id=? AND is_deleted=0
             """, (deleted_at, int(msg_id)))
-            updated = int(cur.rowcount or 0)
     else:
         cur.execute("""
             UPDATE messages SET is_deleted=1, deletion_date=?
             WHERE msg_id=? AND is_deleted=0
         """, (deleted_at, int(msg_id)))
-        updated = int(cur.rowcount or 0)
-    row = None
-    if updated > 0:
-        if chat_id:
-            cur.execute("SELECT * FROM messages WHERE chat_id=? AND msg_id=? LIMIT 1", (int(chat_id), int(msg_id)))
-        else:
-            cur.execute("SELECT * FROM messages WHERE msg_id=? ORDER BY date DESC LIMIT 1", (int(msg_id),))
-        row = cur.fetchone()
     conn.commit()
     conn.close()
-    if not row:
-        return
-    try:
-        qdir = notify_queue_dir()
-        fname = f"{int(time.time()*1000)}_{chat_id}_{msg_id}.json"
-        row_dict = dict(row) if not isinstance(row, dict) else row
-        with open(os.path.join(qdir, fname), "w", encoding="utf-8") as f:
-            json.dump(row_dict, f, ensure_ascii=False)
-    except Exception as e:
-        _log(f"queue write failed: {e}")
 
 async def main():
     print("[receiver] starting main()")

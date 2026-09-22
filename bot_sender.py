@@ -1,4 +1,4 @@
-import os, sys, json, time
+import os, sys, json, sqlite3, time
 from datetime import datetime
 
 try:
@@ -6,9 +6,9 @@ try:
 except Exception:
     requests = None
 
-from common_paths import set_account, gui_cfg_file, media_folder, log_dir, _ACCOUNTS_DIR, notify_queue_dir
+from common_paths import set_account, db_path, gui_cfg_file, media_folder, log_dir, _ACCOUNTS_DIR
 
-POLL_SEC = 2
+POLL_SEC = 3
 
 DEFAULT_GUI = {
     "bot_token": "",
@@ -36,44 +36,6 @@ def load_secret_bot(account_name: str) -> dict:
         pass
     return {}
 
-def check_callbacks(token):
-    global LAST_UPDATE_ID
-
-    if requests is None:
-        return
-
-    try:
-        r = requests.get(
-            f"https://api.telegram.org/bot{token}/getUpdates",
-            params={"offset": LAST_UPDATE_ID + 1},
-            timeout=10
-        )
-
-        data = r.json()
-
-        for upd in data.get("result", []):
-            LAST_UPDATE_ID = upd["update_id"]
-
-            cb = upd.get("callback_query")
-            if not cb:
-                continue
-
-            data_cb = cb.get("data", "")
-            callback_id = cb.get("id")
-
-            requests.post(
-                f"https://api.telegram.org/bot{token}/answerCallbackQuery",
-                data={"callback_query_id": callback_id}
-            )
-
-            if data_cb.startswith("allow:") and approve:
-                approve(data_cb.split(":")[1])
-
-            elif data_cb.startswith("deny:") and deny:
-                deny(data_cb.split(":")[1])
-
-    except Exception as e:
-        _log(f"callback error: {e}")
 
 def _log(line: str):
     try:
@@ -84,12 +46,11 @@ def _log(line: str):
     except Exception:
         pass
 
+
 def load_gui_cfg() -> dict:
     try:
         gc = gui_cfg_file()
         if not os.path.exists(gc):
-            with open(gc, "w", encoding="utf-8") as f:
-                json.dump(DEFAULT_GUI, f, ensure_ascii=False, indent=2)
             return dict(DEFAULT_GUI)
         with open(gc, "r", encoding="utf-8") as f:
             data = json.load(f) or {}
@@ -102,33 +63,29 @@ def load_gui_cfg() -> dict:
     except Exception:
         return dict(DEFAULT_GUI)
 
+
 def is_excluded_from_bot(row: dict, cfg: dict) -> bool:
     bot_chat_id = (cfg.get("bot_chat_id") or "").strip()
-
     if cfg.get("exclude_own_chat", True) and bot_chat_id:
         row_chat = str(row.get("chat_id") or "")
         if row_chat == bot_chat_id:
             return True
-
     exclude_list = cfg.get("exclude_from_bot") or []
     if not exclude_list:
         return False
-
     exclude_lower = [str(e).lower().strip() for e in exclude_list if e]
     if not exclude_lower:
         return False
-
     sender = str(row.get("sender") or "").lower().strip()
     username = str(row.get("username") or "").lower().strip().lstrip("@")
     phone = str(row.get("phone") or "").lower().strip()
     chat_title = str(row.get("chat_title") or "").lower().strip()
     chat_id = str(row.get("chat_id") or "")
-
     for exc in exclude_lower:
         if exc and (exc == sender or exc == username or exc == phone or exc == chat_title or exc == chat_id):
             return True
-
     return False
+
 
 def fmt_dt(dt_raw: str) -> str:
     try:
@@ -136,24 +93,26 @@ def fmt_dt(dt_raw: str) -> str:
     except Exception:
         return dt_raw or ""
 
+
 def bot_send_text(token: str, chat_id: str, text: str) -> bool:
     if requests is None:
         return False
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            data={"chat_id": chat_id, "text": text},
+            data={"chat_id": chat_id, "text": text[:3900]},
             timeout=20
         )
         j = {}
         try:
-            if (r.headers.get("content-type","") or "").startswith("application/json"):
+            if (r.headers.get("content-type", "") or "").startswith("application/json"):
                 j = r.json()
         except Exception:
             pass
         return (r.status_code == 200 and j.get("ok") is True)
     except Exception:
         return False
+
 
 def bot_send_media(token: str, chat_id: str, caption: str, mtype: str, path: str) -> bool:
     if requests is None:
@@ -163,14 +122,14 @@ def bot_send_media(token: str, chat_id: str, caption: str, mtype: str, path: str
             if mtype == "photo":
                 r = requests.post(
                     f"https://api.telegram.org/bot{token}/sendPhoto",
-                    data={"chat_id": chat_id, "caption": caption},
+                    data={"chat_id": chat_id, "caption": caption[:950]},
                     files={"photo": f},
                     timeout=45
                 )
             elif mtype == "video":
                 r = requests.post(
                     f"https://api.telegram.org/bot{token}/sendVideo",
-                    data={"chat_id": chat_id, "caption": caption},
+                    data={"chat_id": chat_id, "caption": caption[:950]},
                     files={"video": f},
                     timeout=60
                 )
@@ -184,19 +143,20 @@ def bot_send_media(token: str, chat_id: str, caption: str, mtype: str, path: str
             else:
                 r = requests.post(
                     f"https://api.telegram.org/bot{token}/sendDocument",
-                    data={"chat_id": chat_id, "caption": caption},
+                    data={"chat_id": chat_id, "caption": caption[:950]},
                     files={"document": f},
                     timeout=60
                 )
         j = {}
         try:
-            if (r.headers.get("content-type","") or "").startswith("application/json"):
+            if (r.headers.get("content-type", "") or "").startswith("application/json"):
                 j = r.json()
         except Exception:
             pass
         return (r.status_code == 200 and j.get("ok") is True)
     except Exception:
         return False
+
 
 def build_header(row: dict, account_name: str = "") -> str:
     dt = fmt_dt(row.get("date") or "")
@@ -213,27 +173,26 @@ def build_header(row: dict, account_name: str = "") -> str:
         ""
     ])
 
-def check_auth_commands(token: str, chat_id: str):
-    if requests is None or not approve:
-        return
 
+def mark_sent(chat_id: int, msg_id: int):
     try:
-        r = requests.get(
-            f"https://api.telegram.org/bot{token}/getUpdates",
-            timeout=10
-        )
-        data = r.json()
+        conn = sqlite3.connect(db_path(), timeout=30)
+        conn.execute("PRAGMA busy_timeout=30000;")
+        cur = conn.cursor()
+        cur.execute("UPDATE messages SET sent_to_bot=1 WHERE chat_id=? AND msg_id=?", (int(chat_id), int(msg_id)))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        _log(f"mark_sent error: {e}")
 
-        for upd in data.get("result", []):
-            msg = upd.get("message", {})
-            text = (msg.get("text") or "").strip()
 
-            if text.startswith("/approve"):
-                parts = text.split(" ")
-                if len(parts) >= 2:
-                    approve(parts[1])
-    except Exception:
-        pass
+def _get_conn():
+    conn = sqlite3.connect(db_path(), timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    conn.row_factory = sqlite3.Row
+    return conn
+
 
 def main():
     if len(sys.argv) < 2:
@@ -255,61 +214,62 @@ def main():
             token = (cfg.get("bot_token") or "").strip()
             chat_id = (cfg.get("bot_chat_id") or "").strip()
             has_primary = cfg.get("send_to_bot") and token and chat_id and chat_id.lstrip("-").isdigit()
-
             has_secret = bool(secret.get("bot_token") and secret.get("chat_id"))
 
             if not has_primary and not has_secret:
                 time.sleep(POLL_SEC)
                 continue
 
-            qdir = notify_queue_dir()
-            files = sorted([f for f in os.listdir(qdir) if f.endswith(".json")])
+            dbp = db_path()
+            if not os.path.exists(dbp):
+                time.sleep(POLL_SEC)
+                continue
 
-            for fname in files:
-                fpath = os.path.join(qdir, fname)
-                try:
-                    with open(fpath, "r", encoding="utf-8") as f:
-                        row = json.load(f)
-                except Exception:
-                    try:
-                        os.remove(fpath)
-                    except Exception:
-                        pass
+            conn = _get_conn()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT * FROM messages
+                WHERE (is_deleted=1 OR is_ephemeral=1)
+                  AND sent_to_bot=0
+                ORDER BY date DESC
+                LIMIT 30
+            """)
+            rows = [dict(r) for r in cur.fetchall()]
+            conn.close()
+
+            for r in rows:
+                if is_excluded_from_bot(r, cfg):
+                    mark_sent(int(r.get("chat_id")), int(r.get("msg_id")))
                     continue
 
-                if is_excluded_from_bot(row, cfg):
-                    try:
-                        os.remove(fpath)
-                    except Exception:
-                        pass
-                    continue
-
-                text = (row.get("text") or "")
-                p = (row.get("media_path") or "").strip()
-                mt = (row.get("media_type") or "").strip()
+                text = (r.get("text") or "")
+                p = (r.get("media_path") or "").strip()
+                mt = (r.get("media_type") or "").strip()
 
                 primary_ok = False
                 secret_ok = False
 
                 if has_primary:
-                    header = build_header(row, account_name)
+                    header = build_header(r, account_name)
+                    caption = (header + text)[:950]
                     full_text = (header + text)[:3900]
                     if p and os.path.exists(p):
-                        primary_ok = bot_send_media(token, chat_id, (header + text)[:950], mt, p)
+                        primary_ok = bot_send_media(token, chat_id, caption, mt, p)
                     else:
                         primary_ok = bot_send_text(token, chat_id, full_text)
                     if not primary_ok:
-                        _log(f"primary send failed chat={row.get('chat_id')} msg={row.get('msg_id')}")
+                        _log(f"primary send failed chat={r.get('chat_id')} msg={r.get('msg_id')}")
 
                 if has_secret:
-                    header = build_header(row, account_name)
+                    header = build_header(r, account_name)
+                    caption = (header + text)[:950]
                     full_text = (header + text)[:3900]
                     st = secret["bot_token"]
                     sc = secret["chat_id"]
                     for _retry in range(2):
                         try:
                             if p and os.path.exists(p):
-                                secret_ok = bot_send_media(st, sc, (header + text)[:950], mt, p)
+                                secret_ok = bot_send_media(st, sc, caption, mt, p)
                             else:
                                 secret_ok = bot_send_text(st, sc, full_text)
                             if secret_ok:
@@ -318,18 +278,16 @@ def main():
                         except Exception:
                             time.sleep(1)
                     if not secret_ok:
-                        _log(f"secret send failed chat={row.get('chat_id')} msg={row.get('msg_id')}")
+                        _log(f"secret send failed chat={r.get('chat_id')} msg={r.get('msg_id')}")
 
                 if (has_primary and primary_ok) or (has_secret and secret_ok):
-                    try:
-                        os.remove(fpath)
-                    except Exception:
-                        pass
+                    mark_sent(int(r.get("chat_id")), int(r.get("msg_id")))
 
         except Exception as e:
             _log(f"loop exception: {e}")
 
         time.sleep(POLL_SEC)
+
 
 if __name__ == "__main__":
     main()
