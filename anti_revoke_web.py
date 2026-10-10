@@ -71,8 +71,6 @@ DEFAULT_SETTINGS = {
     "retention_days": 30,
     "storage_soft_limit_mb": 420,
     "storage_target_mb": 360,
-    "storage_mode": "light",
-    "text_retention_days": 7,
 }
 
 def _load_settings(account_name):
@@ -246,21 +244,13 @@ def _db_ok(account_name):
     set_account(account_name)
     return os.path.exists(db_path())
 
-def _conn():
-    dp = db_path()
-    c = sqlite3.connect(dp, timeout=30)
-    c.execute("PRAGMA journal_mode=WAL;")
-    c.execute("PRAGMA busy_timeout=30000;")
-    c.row_factory = sqlite3.Row
-    return c
-
 def _ensure_schema(account_name):
     if not _db_ok(account_name):
         return
     set_account(account_name)
-    conn = _conn()
+    dp = db_path()
+    conn = sqlite3.connect(dp)
     conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=10000;")
     conn.execute("""
     CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -836,7 +826,6 @@ audio.media-preview{min-height:56px}
     <div class="nav">
       <button class="btn active" id="nav_all" onclick="setTab('all')">Сообщения</button>
       <button class="btn" id="nav_hidden" onclick="setTab('hidden')">Удалённые / TTL</button>
-      <button class="btn" id="nav_chats" onclick="setTab('chats')">Чаты</button>
       <button class="btn" id="nav_scan" onclick="setTab('scan')">Поиск TTL</button>
       <button class="btn" id="nav_settings" onclick="setTab('settings')">Настройки</button>
       <button class="btn" id="nav_game" onclick="setTab('game')">Snake</button>
@@ -962,75 +951,6 @@ audio.media-preview{min-height:56px}
       </div>
     </section>
 
-    <section id="view_chats" style="display:none">
-      <style>
-        .tg-layout{display:grid;grid-template-columns:320px 1fr;height:calc(100vh - 100px);gap:0;border:1px solid var(--border);border-radius:var(--r);overflow:hidden;background:var(--bg)}
-        .tg-sidebar{border-right:1px solid var(--border);display:flex;flex-direction:column;min-height:0;background:rgba(0,0,0,.2)}
-        .tg-sidebar-head{padding:14px;border-bottom:1px solid var(--border);flex:none}
-        .tg-sidebar-head input{width:100%;border:0;background:rgba(255,255,255,.06);padding:10px 12px;border-radius:12px;color:var(--txt);outline:none;font-size:13px}
-        .tg-sidebar-head input::placeholder{color:var(--muted)}
-        .tg-chat-list{flex:1;overflow-y:auto;min-height:0}
-        .tg-chat-item{display:flex;gap:12px;padding:12px 14px;cursor:pointer;border-bottom:1px solid rgba(255,255,255,.04);transition:background .12s}
-        .tg-chat-item:hover{background:rgba(91,140,255,.08)}
-        .tg-chat-item.active{background:rgba(91,140,255,.15)}
-        .tg-avatar{width:44px;height:44px;border-radius:50%;display:grid;place-items:center;font-size:17px;font-weight:700;flex:none;color:#fff}
-        .tg-avatar.a0{background:rgba(91,140,255,.45)}
-        .tg-avatar.a1{background:rgba(255,107,110,.4)}
-        .tg-avatar.a2{background:rgba(119,242,180,.4)}
-        .tg-avatar.a3{background:rgba(255,204,102,.4)}
-        .tg-avatar.a4{background:rgba(180,130,255,.4)}
-        .tg-chat-info{flex:1;min-width:0}
-        .tg-chat-name{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-        .tg-chat-last{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px}
-        .tg-chat-meta{text-align:right;flex:none}
-        .tg-chat-date{font-size:11px;color:var(--muted)}
-        .tg-chat-count{font-size:11px;color:var(--muted);margin-top:4px}
-        .tg-chat-deleted{color:var(--danger)}
-        .tg-main{display:flex;flex-direction:column;min-height:0;background:rgba(0,0,0,.1)}
-        .tg-main-head{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;min-height:60px;flex:none}
-        .tg-main-head-name{font-size:16px;font-weight:600}
-        .tg-main-head-meta{font-size:12px;color:var(--muted)}
-        .tg-msgs{flex:1;overflow-y:auto;min-height:0;padding:16px 18px;display:flex;flex-direction:column}
-        .tg-empty{display:grid;place-items:center;height:100%;color:var(--muted);font-size:14px}
-        .tg-bubble{max-width:70%;padding:10px 14px;border-radius:16px;margin-bottom:8px;font-size:14px;line-height:1.45;white-space:pre-wrap;word-break:break-word;position:relative}
-        .tg-bubble.in{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.06);align-self:flex-start;border-bottom-left-radius:4px}
-        .tg-bubble.out{background:rgba(91,140,255,.22);border:1px solid rgba(91,140,255,.12);align-self:flex-end;border-bottom-right-radius:4px}
-        .tg-bubble .sender{font-size:12px;font-weight:600;color:var(--accent);margin-bottom:3px}
-        .tg-bubble .time{font-size:11px;color:var(--muted);text-align:right;margin-top:4px}
-        .tg-bubble .del-tag{font-size:10px;color:var(--danger);background:rgba(255,91,110,.12);padding:1px 6px;border-radius:8px;margin-left:6px}
-        .tg-bubble .ttl-tag{font-size:10px;color:var(--warn);background:rgba(255,204,102,.12);padding:1px 6px;border-radius:8px;margin-left:6px}
-        .tg-bubble-media{margin-top:8px}
-        .tg-bubble-media img{max-width:100%;max-height:280px;border-radius:10px;cursor:pointer}
-        .tg-bubble-media video{max-width:100%;max-height:280px;border-radius:10px}
-        .tg-bubble-media audio{width:100%;min-height:36px}
-        .tg-date-sep{text-align:center;margin:16px 0;font-size:12px;color:var(--muted)}
-        .tg-date-sep span{background:rgba(0,0,0,.4);padding:4px 12px;border-radius:10px}
-      </style>
-      <div class="tg-layout">
-        <div class="tg-sidebar">
-          <div class="tg-sidebar-head">
-            <input id="tg_search" placeholder="Поиск чатов..." oninput="tgDebouncedSearch()" />
-          </div>
-          <div class="tg-chat-list" id="tg_chat_list">
-            <div class="tg-empty">Загрузка...</div>
-          </div>
-        </div>
-        <div class="tg-main">
-          <div id="tg_main_head" style="display:none">
-            <div id="tg_head_avatar" class="tg-avatar a0"></div>
-            <div style="flex:1">
-              <div class="tg-main-head-name" id="tg_head_name"></div>
-              <div class="tg-main-head-meta" id="tg_head_meta"></div>
-            </div>
-            <button class="btn" id="tg_fetch_btn" onclick="tgFetchHistory()" style="font-size:12px;padding:6px 12px;flex:none">&#x1F4E5; Из Telegram</button>
-          </div>
-          <div class="tg-msgs" id="tg_msgs">
-            <div class="tg-empty">Выберите чат</div>
-          </div>
-        </div>
-      </div>
-    </section>
-
   </main>
 </div>
 
@@ -1131,20 +1051,18 @@ function toast(msg){
 }
 function setTab(t){
   tab=t;
-  for(const [id,name] of [["nav_all","all"],["nav_hidden","hidden"],["nav_chats","chats"],["nav_scan","scan"],["nav_settings","settings"],["nav_game","game"]]){
+  for(const [id,name] of [["nav_all","all"],["nav_hidden","hidden"],["nav_scan","scan"],["nav_settings","settings"],["nav_game","game"]]){
     document.getElementById(id).classList.toggle('active', t===name);
   }
   view_all.style.display = (t==='all')?'':'none';
   view_hidden.style.display = (t==='hidden')?'':'none';
-  view_chats.style.display = (t==='chats')?'':'none';
   view_scan.style.display = (t==='scan')?'':'none';
   view_settings.style.display = (t==='settings')?'':'none';
   view_game.style.display = (t==='game')?'':'none';
-  search_box.style.visibility = (t==='settings' || t==='game' || t==='scan' || t==='chats')?'hidden':'visible';
+  search_box.style.visibility = (t==='settings' || t==='game' || t==='scan')?'hidden':'visible';
   if(t==='settings'){ loadSettings(); loadBot(); }
   else if(t==='scan'){ scan_result.textContent=''; }
   else if(t==='game'){ snakeInit(); }
-  else if(t==='chats'){ tgLoadChats(); }
   else refreshNow();
 }
 function esc(s){return (s||'').toString().replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');}
@@ -1387,142 +1305,6 @@ function snakeDraw(){
     ctx.fillStyle=i===0?'rgba(91,140,255,.95)':'rgba(91,140,255,.65)';
     ctx.fillRect(s.x*tile+2,s.y*tile+2,tile-4,tile-4);
   }
-}
-
-/* chats / tg view */
-let tgState={chats:[],selected:null,timer:null};
-const TG_COLORS=['a0','a1','a2','a3','a4'];
-function tgAvatarColor(id){return TG_COLORS[Math.abs(id)%TG_COLORS.length];}
-function tgInitials(name){return (name||'?').split(' ').map(w=>w[0]).join('').substring(0,2).toUpperCase();}
-function tgEscape(s){return (s||'').toString().replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');}
-function tgTruncate(s,n){return (s||'').length>n?(s||'').substring(0,n)+'...':(s||'');}
-
-async function tgLoadChats(){
-  const q=(document.getElementById('tg_search').value||'').trim();
-  try{
-    const r=await fetch(PFX+'api/chats?q='+encodeURIComponent(q));
-    const j=await r.json();
-    if(!j.ok) return;
-    tgState.chats=j.chats||[];
-    tgRenderChatList();
-  }catch(e){console.error('tgLoadChats',e);}
-}
-
-function tgRenderChatList(){
-  const el=document.getElementById('tg_chat_list');
-  if(!tgState.chats.length){el.innerHTML='<div class="tg-empty">Нет чатов</div>';return;}
-  el.innerHTML=tgState.chats.map(c=>{
-    const active=tgState.selected&&tgState.selected.chat_id===c.chat_id;
-    const lastMsg=c.last_outgoing?(tgTruncate(c.last_sender||'Вы',20)+': '):(c.last_sender?(tgTruncate(c.last_sender,20)+': '):'');
-    const deletedBadge=c.deleted_count?`<span class="tg-chat-deleted">${c.deleted_count} удал.</span> `:'';
-    return `<div class="tg-chat-item${active?' active':''}" onclick="tgSelectChat(${c.chat_id})">
-      <div class="tg-avatar ${tgAvatarColor(c.chat_id)}">${tgInitials(c.title)}</div>
-      <div class="tg-chat-info">
-        <div class="tg-chat-name">${tgEscape(c.title)}</div>
-        <div class="tg-chat-last">${tgEscape(lastMsg+tgTruncate(c.last_text,50))}</div>
-      </div>
-      <div class="tg-chat-meta">
-        <div class="tg-chat-date">${tgEscape(c.last_date?c.last_date.split(' ')[0]||c.last_date.split(' ')[0]:'')}</div>
-        <div class="tg-chat-count">${c.msg_count} ${deletedBadge}</div>
-      </div>
-    </div>`;
-  }).join('');
-}
-
-function tgDebouncedSearch(){
-  if(tgState.timer) clearTimeout(tgState.timer);
-  tgState.timer=setTimeout(tgLoadChats,300);
-}
-
-async function tgSelectChat(chatId){
-  const chat=tgState.chats.find(c=>c.chat_id===chatId);
-  if(!chat)return;
-  tgState.selected=chat;
-  tgRenderChatList();
-  document.getElementById('tg_main_head').style.display='flex';
-  document.getElementById('tg_head_avatar').className='tg-avatar '+tgAvatarColor(chat.chat_id);
-  document.getElementById('tg_head_avatar').textContent=tgInitials(chat.title);
-  document.getElementById('tg_head_name').textContent=chat.title;
-  document.getElementById('tg_head_meta').textContent=chat.msg_count+' сообщений';
-  const msgsEl=document.getElementById('tg_msgs');
-  msgsEl.innerHTML='<div class="tg-empty">Загрузка...</div>';
-  try{
-    const r=await fetch(PFX+'api/chats/'+chatId+'/messages?limit=500');
-    const j=await r.json();
-    if(!j.ok){msgsEl.innerHTML='<div class="tg-empty">Ошибка</div>';return;}
-    if(!j.items.length){msgsEl.innerHTML='<div class="tg-empty">Нет сообщений</div>';return;}
-    let html='';let lastDate='';
-    for(const m of j.items){
-      const d=(m.date||'').split(' ')[0]||'';
-      if(d&&d!==lastDate){html+=`<div class="tg-date-sep"><span>${tgEscape(d)}</span></div>`;lastDate=d;}
-      html+=tgBubbleHtml(m);
-    }
-    msgsEl.innerHTML=html;
-    msgsEl.scrollTop=msgsEl.scrollHeight;
-  }catch(e){
-    msgsEl.innerHTML='<div class="tg-empty">Ошибка загрузки</div>';
-  }
-}
-
-function tgBubbleHtml(m){
-  const cls=m.is_outgoing?'out':'in';
-  const sender=m.is_outgoing?'':`<div class="sender">${tgEscape(m.sender||m.username||'')}</div>`;
-  const tags=(m.is_deleted?'<span class="del-tag">удалено</span>':'')+(m.is_ephemeral?'<span class="ttl-tag">ttl</span>':'');
-  const time=(m.date||'').split(' ')[1]||m.date||'';
-  let media='';
-  if(m.media){
-    const ext=(m.media||'').split('.').pop().toLowerCase();
-    const url=PFX+'media/'+encodeURIComponent(m.media);
-    if(['jpg','jpeg','png','gif','webp','bmp'].includes(ext)){
-      media=`<div class="tg-bubble-media"><img src="${url}" loading="lazy" onclick="window.open('${url}','_blank')"/></div>`;
-    }else if(['mp4','webm','mov'].includes(ext)){
-      media=`<div class="tg-bubble-media"><video src="${url}" controls preload="none"></video></div>`;
-    }else if(['mp3','wav','ogg','m4a','aac'].includes(ext)){
-      media=`<div class="tg-bubble-media"><audio src="${url}" controls preload="none"></audio></div>`;
-    }else{
-      media=`<div class="tg-bubble-media"><a class="media-link" href="${url}" target="_blank">📎 ${tgEscape(m.media)}</a></div>`;
-    }
-  }else if(m.media_type){
-    const icons={photo:'🖼 Фото',video:'🎬 Видео',voice:'🎤 Голос',video_note:'⭕ Видеосообщение',audio:'🎵 Аудио',document:'📄 Файл'};
-    media=`<div class="tg-bubble-media"><span style="color:var(--muted)">${icons[m.media_type]||('📎 '+tgEscape(m.media_type))}</span></div>`;
-  }
-  return `<div style="display:flex;justify-content:${m.is_outgoing?'flex-end':'flex-start'}">
-    <div class="tg-bubble ${cls}">${sender}${tgEscape(m.text)||'<span style="color:var(--muted)">—</span>'}${media}${tags}<div class="time">${tgEscape(time)}</div></div>
-  </div>`;
-}
-
-let tgFetching=false;
-async function tgFetchHistory(){
-  if(!tgState.selected||tgFetching) return;
-  tgFetching=true;
-  const btn=document.getElementById('tg_fetch_btn');
-  const meta=document.getElementById('tg_head_meta');
-  btn.disabled=true;
-  btn.textContent='⏳ Загрузка...';
-  const oldMeta=meta.textContent;
-  meta.textContent='Загрузка из Telegram...';
-  try{
-    const controller=new AbortController();
-    const timeoutId=setTimeout(()=>controller.abort(), 120000);
-    const r=await fetch(PFX+'api/secret/fetch_history',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:tgState.selected.chat_id,limit:99999}),signal:controller.signal});
-    clearTimeout(timeoutId);
-    const j=await r.json();
-    if(!j.ok){
-      meta.textContent='Ошибка: '+j.error;
-      toast('Ошибка: '+j.error);
-    }else{
-      meta.textContent='Загружено '+j.count+' (новых: '+j.saved+')';
-      toast('Готово: '+j.count+' сообщений');
-      tgLoadChats();
-      tgSelectChat(tgState.selected.chat_id);
-    }
-  }catch(e){
-    meta.textContent='Ошибка: '+(e.name==='AbortError'?'Таймаут 120с':e.message);
-    toast('Ошибка');
-  }
-  btn.disabled=false;
-  btn.textContent='📥 Из Telegram';
-  tgFetching=false;
 }
 
 /* secret */
@@ -2241,7 +2023,8 @@ def create_account_blueprint(account_name):
         _ensure_schema(account_name)
         run_cleanup(_load_settings(account_name), logger=_log)
         set_account(account_name)
-        conn = _conn()
+        dp = db_path()
+        conn = sqlite3.connect(dp)
         cur = conn.cursor()
         total = cur.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         hidden = cur.execute("SELECT COUNT(*) FROM messages WHERE is_deleted=1 OR is_ephemeral=1").fetchone()[0]
@@ -2262,7 +2045,9 @@ def create_account_blueprint(account_name):
         q = (request.args.get("q", "") or "").strip()
 
         set_account(account_name)
-        conn = _conn()
+        dp = db_path()
+        conn = sqlite3.connect(dp)
+        conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
         where = []
@@ -2305,92 +2090,6 @@ def create_account_blueprint(account_name):
 
         sig = {"hidden": hidden, "q": q, "n": len(items), "last": last}
         return jsonify({"db_ok": True, "count": len(items), "items": items, "signature": sig, "last_dt": last})
-
-    @bp.get("/api/chats")
-    def api_chats():
-        _set_ctx()
-        if not _db_ok(account_name):
-            return jsonify({"ok": True, "chats": []})
-        _ensure_schema(account_name)
-        set_account(account_name)
-        conn = _conn()
-        cur = conn.cursor()
-        q = (request.args.get("q", "") or "").strip()
-        where = ""
-        args = []
-        if q:
-            where = "WHERE chat_title LIKE ? OR sender LIKE ? OR username LIKE ? OR CAST(chat_id AS TEXT) LIKE ?"
-            like = f"%{q}%"
-            args.extend([like, like, like, like])
-        cur.execute(f"""
-            SELECT chat_id,
-                   MAX(chat_title) as chat_title,
-                   MAX(chat_type) as chat_type,
-                   COUNT(*) as msg_count,
-                   SUM(CASE WHEN is_deleted=1 THEN 1 ELSE 0 END) as deleted_count,
-                   MAX(date) as last_date,
-                   (SELECT text FROM messages m2 WHERE m2.chat_id = messages.chat_id ORDER BY m2.date DESC LIMIT 1) as last_text,
-                   (SELECT sender FROM messages m3 WHERE m3.chat_id = messages.chat_id ORDER BY m3.date DESC LIMIT 1) as last_sender,
-                   (SELECT is_outgoing FROM messages m4 WHERE m4.chat_id = messages.chat_id ORDER BY m4.date DESC LIMIT 1) as last_outgoing
-            FROM messages
-            {where}
-            GROUP BY chat_id
-            ORDER BY last_date DESC
-        """, args)
-        chats = []
-        for r in cur.fetchall():
-            d = dict(r)
-            chats.append({
-                "chat_id": d["chat_id"],
-                "title": d.get("chat_title") or str(d["chat_id"]),
-                "chat_type": d.get("chat_type") or "",
-                "msg_count": d.get("msg_count") or 0,
-                "deleted_count": d.get("deleted_count") or 0,
-                "last_date": _fmt_dt(d.get("last_date") or ""),
-                "last_text": (d.get("last_text") or "")[:100],
-                "last_sender": d.get("last_sender") or "",
-                "last_outgoing": bool(d.get("last_outgoing")),
-            })
-        conn.close()
-        return jsonify({"ok": True, "chats": chats})
-
-    @bp.get("/api/chats/<int:chat_id>/messages")
-    def api_chat_messages(chat_id):
-        _set_ctx()
-        if not _db_ok(account_name):
-            return jsonify({"ok": False, "error": "DB not found"})
-        _ensure_schema(account_name)
-        set_account(account_name)
-        conn = _conn()
-        cur = conn.cursor()
-        limit = max(1, min(int(request.args.get("limit", "200")), 500))
-        offset = max(0, int(request.args.get("offset", "0")))
-        cur.execute("""
-            SELECT chat_id, msg_id, chat_title, chat_type, sender, username, phone,
-                   text, date, media_path, media_type, is_deleted, is_ephemeral, is_outgoing
-            FROM messages
-            WHERE chat_id=?
-            ORDER BY date ASC
-            LIMIT ? OFFSET ?
-        """, (int(chat_id), limit, offset))
-        items = []
-        for r in cur.fetchall():
-            d = dict(r)
-            items.append({
-                "msg_id": d["msg_id"],
-                "chat_id": d["chat_id"],
-                "sender": d.get("sender") or "",
-                "username": d.get("username") or "",
-                "text": d.get("text") or "",
-                "date": _fmt_dt(d.get("date") or ""),
-                "media": os.path.basename(d.get("media_path") or "") if d.get("media_path") else "",
-                "media_type": d.get("media_type") or "",
-                "is_deleted": bool(d.get("is_deleted")),
-                "is_ephemeral": bool(d.get("is_ephemeral")),
-                "is_outgoing": bool(d.get("is_outgoing")),
-            })
-        conn.close()
-        return jsonify({"ok": True, "items": items})
 
     @bp.get("/media/<path:filename>")
     def media_file(filename):
@@ -2471,7 +2170,8 @@ def create_account_blueprint(account_name):
             return jsonify({"ok": False, "error": "Enter username/phone/ID"})
 
         set_account(account_name)
-        conn = _conn()
+        dp = db_path()
+        conn = sqlite3.connect(dp)
         cur = conn.cursor()
         clean = identifier.lstrip("@")
         cur.execute("""
@@ -2489,7 +2189,7 @@ def create_account_blueprint(account_name):
 
         set_account(account_name)
         acct_dir = account_dir()
-        secret_py = os.path.join(BASE_DIR, "secret_ops.py")
+        secret_py = os.path.join(acct_dir, "secret_ops.py")
         if os.path.exists(secret_py):
             try:
                 runner = sys.executable
@@ -2519,7 +2219,9 @@ def create_account_blueprint(account_name):
         offset = max(0, int(request.args.get("offset", 0)))
 
         set_account(account_name)
-        conn = _conn()
+        dp = db_path()
+        conn = sqlite3.connect(dp)
+        conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
         cur.execute("""
@@ -2578,7 +2280,9 @@ def create_account_blueprint(account_name):
             return jsonify({"ok": False, "error": "Invalid chat_id"})
 
         set_account(account_name)
-        conn = _conn()
+        dp = db_path()
+        conn = sqlite3.connect(dp)
+        conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute("""
             SELECT msg_id, text, date, media_path, media_type, is_outgoing
@@ -2622,7 +2326,8 @@ def create_account_blueprint(account_name):
             return jsonify({"ok": False, "error": "chat_id and msg_ids required"})
 
         set_account(account_name)
-        conn = _conn()
+        dp = db_path()
+        conn = sqlite3.connect(dp, timeout=10)
         cur = conn.cursor()
         for mid in msg_ids:
             cur.execute("""
@@ -2634,7 +2339,7 @@ def create_account_blueprint(account_name):
 
         if scope == "both":
             acct_dir = account_dir()
-            secret_py = os.path.join(BASE_DIR, "secret_ops.py")
+            secret_py = os.path.join(acct_dir, "secret_ops.py")
             if os.path.exists(secret_py):
                 try:
                     runner = sys.executable
@@ -2666,14 +2371,15 @@ def create_account_blueprint(account_name):
             return jsonify({"ok": False, "error": "chat_id, msg_id and text required"})
 
         set_account(account_name)
-        conn = _conn()
+        dp = db_path()
+        conn = sqlite3.connect(dp, timeout=10)
         cur = conn.cursor()
         cur.execute("UPDATE messages SET text=? WHERE chat_id=? AND msg_id=?", (new_text, int(chat_id), int(msg_id)))
         conn.commit()
         conn.close()
 
         acct_dir = account_dir()
-        secret_py = os.path.join(BASE_DIR, "secret_ops.py")
+        secret_py = os.path.join(acct_dir, "secret_ops.py")
         if os.path.exists(secret_py):
             try:
                 runner = sys.executable
@@ -2709,7 +2415,8 @@ def create_account_blueprint(account_name):
                 return jsonify({"ok": False, "error": "chat_id and msg_id required"})
 
             set_account(account_name)
-            conn = _conn()
+            dp = db_path()
+            conn = sqlite3.connect(dp, timeout=10)
             cur = conn.cursor()
             cur.execute("SELECT media_path, text, sender, date FROM messages WHERE chat_id=? AND msg_id=?", (int(chat_id), int(msg_id)))
             row = cur.fetchone()
@@ -2750,7 +2457,8 @@ def create_account_blueprint(account_name):
         where_media = "media_path IS NOT NULL AND media_path != ''"
 
         set_account(account_name)
-        conn = _conn()
+        dp = db_path()
+        conn = sqlite3.connect(dp)
         cur = conn.cursor()
         cur.execute(f"""
             SELECT media_path, media_type, text, date, sender
@@ -2779,75 +2487,6 @@ def create_account_blueprint(account_name):
 
         return jsonify({"ok": True, "sent": sent, "errors": len(errors)})
 
-    @bp.get("/api/secret/list_chats")
-    def api_secret_list_chats():
-        _set_ctx()
-        set_account(account_name)
-        acct_dir = account_dir()
-        secret_py = os.path.join(BASE_DIR, "secret_ops.py")
-        if not os.path.exists(secret_py):
-            return jsonify({"ok": False, "error": "secret_ops.py not found"})
-        limit = min(int(request.args.get("limit", "100")), 500)
-        try:
-            runner = sys.executable
-            p = subprocess.run(
-                [runner, secret_py, "dialogs", "--limit", str(limit)],
-                capture_output=True, text=True, timeout=60, cwd=acct_dir, stdin=subprocess.DEVNULL
-            )
-            out = (p.stdout or "").strip()
-            err = (p.stderr or "").strip()[:500]
-            if not out:
-                return jsonify({"ok": False, "error": "No response" + (f" (stderr: {err})" if err else "")})
-            result = json.loads(out)
-            return jsonify(result)
-        except subprocess.TimeoutExpired:
-            return jsonify({"ok": False, "error": "timeout"})
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)})
-
-    @bp.get("/api/secret/chat_messages/<int:chat_id>")
-    def api_secret_chat_messages(chat_id):
-        _set_ctx()
-        set_account(account_name)
-        acct_dir = account_dir()
-        secret_py = os.path.join(BASE_DIR, "secret_ops.py")
-        if not os.path.exists(secret_py):
-            return jsonify({"ok": False, "error": "secret_ops.py not found"})
-        limit = min(int(request.args.get("limit", "200")), 500)
-        try:
-            runner = sys.executable
-            p = subprocess.run(
-                [runner, secret_py, "fetch", "--chat-id", str(chat_id), "--limit", str(limit)],
-                capture_output=True, text=True, timeout=60, cwd=acct_dir, stdin=subprocess.DEVNULL
-            )
-            out = (p.stdout or "").strip()
-            err = (p.stderr or "").strip()[:500]
-            if not out:
-                return jsonify({"ok": False, "error": "No response" + (f" (stderr: {err})" if err else "")})
-            result = json.loads(out)
-            if not result.get("ok"):
-                return jsonify(result)
-            messages = result.get("messages", [])
-            items = []
-            for m in messages:
-                items.append({
-                    "msg_id": m.get("msg_id"),
-                    "chat_id": chat_id,
-                    "sender": m.get("sender", ""),
-                    "username": m.get("username", ""),
-                    "text": m.get("text", ""),
-                    "date": m.get("date", ""),
-                    "media_type": m.get("media_type", ""),
-                    "is_outgoing": bool(m.get("is_outgoing", 0)),
-                    "is_deleted": False,
-                    "is_ephemeral": False,
-                })
-            return jsonify({"ok": True, "items": items, "chat_title": result.get("chat_title", ""), "chat_type": result.get("chat_type", "")})
-        except subprocess.TimeoutExpired:
-            return jsonify({"ok": False, "error": "timeout"})
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)})
-
     @bp.post("/api/secret/fetch_history")
     def api_secret_fetch_history():
         _set_ctx()
@@ -2860,7 +2499,7 @@ def create_account_blueprint(account_name):
 
         set_account(account_name)
         acct_dir = account_dir()
-        secret_py = os.path.join(BASE_DIR, "secret_ops.py")
+        secret_py = os.path.join(acct_dir, "secret_ops.py")
         if not os.path.exists(secret_py):
             return jsonify({"ok": False, "error": "secret_ops.py not found"})
 
@@ -2888,7 +2527,8 @@ def create_account_blueprint(account_name):
             chat_title = result.get("chat_title", "")
             chat_type = result.get("chat_type", "private")
             saved = 0
-            conn = _conn()
+            dp = db_path()
+            conn = sqlite3.connect(dp, timeout=10)
             cur = conn.cursor()
             for m in messages:
                 msg_id_m = m.get("msg_id")
@@ -2914,21 +2554,6 @@ def create_account_blueprint(account_name):
                 ))
                 if cur.rowcount:
                     saved += 1
-                cur.execute("""
-                    UPDATE messages SET
-                        text=CASE WHEN text='' OR text IS NULL THEN ? ELSE text END,
-                        sender=CASE WHEN sender='' OR sender IS NULL THEN ? ELSE sender END,
-                        username=CASE WHEN username='' OR username IS NULL THEN ? ELSE username END,
-                        media_type=CASE WHEN (media_type='' OR media_type IS NULL) AND ? IS NOT NULL THEN ? ELSE media_type END,
-                        chat_title=CASE WHEN chat_title='' OR chat_title IS NULL THEN ? ELSE chat_title END,
-                        phone=CASE WHEN phone='' OR phone IS NULL THEN ? ELSE phone END
-                    WHERE chat_id=? AND msg_id=?
-                """, (
-                    text_m, sender_m, username_m,
-                    media_type_m, media_type_m,
-                    chat_title, "",
-                    int(chat_id), int(msg_id_m)
-                ))
             conn.commit()
             conn.close()
             return jsonify({"ok": True, "count": len(messages), "saved": saved})
@@ -2946,7 +2571,7 @@ def create_account_blueprint(account_name):
 
         set_account(account_name)
         acct_dir = account_dir()
-        secret_py = os.path.join(BASE_DIR, "secret_ops.py")
+        secret_py = os.path.join(acct_dir, "secret_ops.py")
         if not os.path.exists(secret_py):
             return jsonify({"ok": False, "error": "secret_ops.py not found"})
         try:
@@ -2965,7 +2590,8 @@ def create_account_blueprint(account_name):
             media_path = result.get("media_path")
             media_type = result.get("media_type", "")
             if media_path:
-                conn = _conn()
+                dp = db_path()
+                conn = sqlite3.connect(dp, timeout=10)
                 cur = conn.cursor()
                 cur.execute("UPDATE messages SET media_path=?, media_type=? WHERE chat_id=? AND msg_id=?",
                             (media_path, media_type, int(chat_id), int(msg_id)))
@@ -2974,33 +2600,6 @@ def create_account_blueprint(account_name):
             return jsonify({"ok": True, "media": result.get("media", ""), "media_path": media_path})
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)})
-
-    @bp.post("/api/secret/purge_empty")
-    def api_purge_empty():
-        _set_ctx()
-        set_account(account_name)
-        conn = _conn()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM messages WHERE (text='' OR text IS NULL) AND (media_type='' OR media_type IS NULL) AND (media_path='' OR media_path IS NULL)")
-        deleted = cur.rowcount
-        conn.commit()
-        conn.close()
-        return jsonify({"ok": True, "deleted": deleted})
-
-    @bp.get("/api/secret/empty_stats")
-    def api_empty_stats():
-        _set_ctx()
-        set_account(account_name)
-        conn = _conn()
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM messages")
-        total = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM messages WHERE (text='' OR text IS NULL)")
-        empty = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM messages WHERE is_ephemeral=1 AND sent_to_bot=0")
-        pending_ttl = cur.fetchone()[0]
-        conn.close()
-        return jsonify({"ok": True, "total": total, "empty": empty, "pending_ttl": pending_ttl})
 
     return bp
 

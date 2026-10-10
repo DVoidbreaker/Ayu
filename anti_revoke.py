@@ -1,6 +1,6 @@
 # anti_revoke.py (exe-ready) - TTL fix (media.ttl_seconds)
 # Account-aware version: python anti_revoke.py <account_name>
-import os, json, sqlite3, traceback, shutil, sys, re, time, asyncio
+import os, json, sqlite3, traceback, shutil, sys, re
 from datetime import datetime, timezone
 
 # --- account setup (must happen before any path imports) ---
@@ -33,8 +33,6 @@ DEFAULT_SETTINGS = {
     "retention_days": 30,
     "storage_soft_limit_mb": 420,
     "storage_target_mb": 360,
-    "storage_mode": "light",
-    "text_retention_days": 7,
 }
 
 DEFAULT_GUI = {
@@ -266,14 +264,15 @@ def _notify_bot_for_row(row: dict):
     return ok
 
 def _mark_sent(chat_id: int, msg_id: int):
-    conn = _conn()
+    conn = sqlite3.connect(db_path(), timeout=10)
     cur = conn.cursor()
     cur.execute("UPDATE messages SET sent_to_bot=1 WHERE chat_id=? AND msg_id=?", (int(chat_id), int(msg_id)))
     conn.commit()
     conn.close()
 
 def _fetch_message_row(chat_id: int, msg_id: int) -> dict | None:
-    conn = _conn()
+    conn = sqlite3.connect(db_path(), timeout=10)
+    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     cur.execute("SELECT * FROM messages WHERE chat_id=? AND msg_id=? LIMIT 1", (int(chat_id), int(msg_id)))
     row = cur.fetchone()
@@ -449,15 +448,9 @@ def _build_runtime_session():
             _log(f"runtime session load failed from {session_path}:\n" + traceback.format_exc())
     return sb
 
-def _conn():
-    c = sqlite3.connect(db_path(), timeout=30)
-    c.execute("PRAGMA journal_mode=WAL;")
-    c.execute("PRAGMA busy_timeout=30000;")
-    c.row_factory = sqlite3.Row
-    return c
-
 def ensure_schema():
-    conn = _conn()
+    conn = sqlite3.connect(db_path())
+    conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("""
     CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -605,52 +598,8 @@ def _is_service_message(sender, text: str) -> bool:
             return True
     return False
 
-def _save_message_sync(chat_id, msg_id, chat_title, chat_type, sender_name, username, phone, dt_iso, text, media_path, media_type, is_ephemeral, is_outgoing):
-    conn = _conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT OR IGNORE INTO messages
-        (chat_id, msg_id, chat_title, chat_type, sender, username, phone, date, text,
-         media_path, media_type, is_deleted, deletion_date, is_ephemeral, sent_to_bot, is_outgoing)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (
-        chat_id, int(msg_id), str(chat_title), str(chat_type),
-        sender_name, username, phone,
-        dt_iso, text,
-        media_path, media_type,
-        0, None,
-        is_ephemeral, 0,
-        is_outgoing
-    ))
-    cur.execute("""
-        UPDATE messages SET
-            chat_title=?,
-            chat_type=?,
-            sender=?,
-            username=?,
-            phone=?,
-            date=?,
-            text=?,
-            media_path=?,
-            media_type=?,
-            is_ephemeral=CASE WHEN ?=1 THEN 1 ELSE is_ephemeral END,
-            is_outgoing=CASE WHEN is_outgoing=0 AND ?=1 THEN 1 ELSE is_outgoing END
-        WHERE chat_id=? AND msg_id=?
-    """, (
-        str(chat_title), str(chat_type),
-        sender_name, username, phone,
-        dt_iso, text,
-        media_path if media_path else None, media_type if media_type else None,
-        int(is_ephemeral),
-        int(is_outgoing),
-        chat_id, int(msg_id)
-    ))
-    conn.commit()
-    conn.close()
-
 async def _save_message(client: TelegramClient, msg: Message):
     s = load_settings()
-    light_mode = s.get("storage_mode", "light") == "light"
 
     chat_id, chat_title, chat_type = await _resolve_chat_info(client, msg)
 
@@ -661,7 +610,6 @@ async def _save_message(client: TelegramClient, msg: Message):
     username = ""
     phone = ""
     sender = None
-
     try:
         sender = await msg.get_sender()
         if sender:
@@ -673,7 +621,7 @@ async def _save_message(client: TelegramClient, msg: Message):
     except Exception:
         pass
 
-    if _is_service_message(sender if sender else None, msg.message or ""):
+    if _is_service_message(sender, msg.message or ""):
         return
 
     is_outgoing = 1 if getattr(msg, "out", False) else 0
@@ -692,7 +640,7 @@ async def _save_message(client: TelegramClient, msg: Message):
     media_path = None
     media_type = _media_type(msg)
 
-    if not light_mode and media_type and ((not is_ephemeral) or bool(s.get("download_ephemeral", True))):
+    if media_type and ((not is_ephemeral) or bool(s.get("download_ephemeral", True))):
         try:
             fname = f"{chat_id}_{msg.id}"
             media_path = await client.download_media(msg, file=os.path.join(media_folder(), fname))
@@ -701,34 +649,87 @@ async def _save_message(client: TelegramClient, msg: Message):
         except Exception as e:
             _log(f"download_media failed chat={chat_id} msg={msg.id}: {e}")
 
-    await asyncio.to_thread(
-        _save_message_sync,
+    conn = sqlite3.connect(db_path(), timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR IGNORE INTO messages
+        (chat_id, msg_id, chat_title, chat_type, sender, username, phone, date, text,
+         media_path, media_type, is_deleted, deletion_date, is_ephemeral, sent_to_bot, is_outgoing)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
         chat_id, int(msg.id), str(chat_title), str(chat_type),
-        sender_name, username, phone, dt_iso, text,
-        media_path, media_type, is_ephemeral, is_outgoing
-    )
+        sender_name, username, phone,
+        dt_iso, text,
+        media_path, media_type,
+        0, None,
+        is_ephemeral, 0,
+        is_outgoing
+    ))
+    cur.execute("""
+        UPDATE messages SET
+            chat_title=COALESCE(?, chat_title),
+            chat_type=COALESCE(?, chat_type),
+            sender=COALESCE(?, sender),
+            username=COALESCE(?, username),
+            phone=COALESCE(?, phone),
+            date=COALESCE(?, date),
+            text=COALESCE(?, text),
+            media_path=COALESCE(?, media_path),
+            media_type=COALESCE(?, media_type),
+            is_ephemeral=CASE WHEN ?=1 THEN 1 ELSE is_ephemeral END,
+            is_outgoing=CASE WHEN is_outgoing=0 AND ?=1 THEN 1 ELSE is_outgoing END
+        WHERE chat_id=? AND msg_id=?
+    """, (
+        str(chat_title), str(chat_type),
+        sender_name or None, username or None, phone or None,
+        dt_iso or None, text or None,
+        media_path or None, media_type or None,
+        int(is_ephemeral),
+        int(is_outgoing),
+        chat_id, int(msg.id)
+    ))
+    conn.commit()
+    conn.close()
 
-def _mark_deleted_sync(chat_id: int, msg_id: int):
-    conn = _conn()
+async def _mark_deleted(chat_id: int, msg_id: int):
+    conn = sqlite3.connect(db_path(), timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL;")
     cur = conn.cursor()
     deleted_at = datetime.now(timezone.utc).isoformat()
+    updated = 0
     if chat_id:
         cur.execute("""
             UPDATE messages SET is_deleted=1, deletion_date=?
             WHERE chat_id=? AND msg_id=? AND is_deleted=0
         """, (deleted_at, int(chat_id), int(msg_id)))
-        if cur.rowcount == 0:
+        updated = int(cur.rowcount or 0)
+        if updated == 0:
             cur.execute("""
                 UPDATE messages SET is_deleted=1, deletion_date=?
                 WHERE msg_id=? AND is_deleted=0
             """, (deleted_at, int(msg_id)))
+            updated = int(cur.rowcount or 0)
     else:
         cur.execute("""
             UPDATE messages SET is_deleted=1, deletion_date=?
             WHERE msg_id=? AND is_deleted=0
         """, (deleted_at, int(msg_id)))
+        updated = int(cur.rowcount or 0)
     conn.commit()
     conn.close()
+    if updated <= 0:
+        return
+    row = _fetch_message_row(chat_id, msg_id)
+    if not row:
+        return
+    ok = _notify_bot_for_row(row)
+    if ok and not _has_secret_bot():
+        _mark_sent(int(row.get("chat_id") or 0), int(row.get("msg_id") or 0))
+    elif not ok and _is_excluded_from_bot(row):
+        _mark_sent(int(row.get("chat_id") or 0), int(row.get("msg_id") or 0))
+    elif not ok:
+        _log(f"bot notify failed chat={row.get('chat_id')} msg={row.get('msg_id')}")
 
 async def main():
     print("[receiver] starting main()")
@@ -778,7 +779,7 @@ async def main():
         try:
             cid = int(event.chat_id or 0)
             for mid in event.deleted_ids:
-                await asyncio.to_thread(_mark_deleted_sync, cid, int(mid))
+                await _mark_deleted(cid, int(mid))
         except Exception:
             _log("on_del exception:\n" + traceback.format_exc())
 
@@ -788,10 +789,10 @@ async def main():
             if isinstance(update, UpdateDeleteChannelMessages):
                 cid = int(getattr(update, "channel_id", 0) or 0)
                 for mid in getattr(update, "messages", []) or []:
-                    await asyncio.to_thread(_mark_deleted_sync, cid, int(mid))
+                    await _mark_deleted(cid, int(mid))
             elif isinstance(update, UpdateDeleteMessages):
                 for mid in getattr(update, "messages", []) or []:
-                    await asyncio.to_thread(_mark_deleted_sync, 0, int(mid))
+                    await _mark_deleted(0, int(mid))
         except Exception:
             _log("on_raw delete exception:\n" + traceback.format_exc())
 
