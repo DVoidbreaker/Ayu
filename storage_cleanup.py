@@ -28,14 +28,17 @@ def normalize_cleanup_settings(settings):
     retention_days = _safe_int(data.get("retention_days"), DEFAULT_RETENTION_DAYS)
     soft_limit_mb = _safe_int(data.get("storage_soft_limit_mb"), DEFAULT_SOFT_LIMIT_MB)
     target_mb = _safe_int(data.get("storage_target_mb"), DEFAULT_TARGET_MB)
+    text_retention_days = _safe_int(data.get("text_retention_days"), 7)
     retention_days = max(MIN_RETENTION_DAYS, retention_days)
     soft_limit_mb = max(MIN_SOFT_LIMIT_MB, soft_limit_mb)
     target_mb = max(MIN_TARGET_MB, target_mb)
+    text_retention_days = max(1, text_retention_days)
     if target_mb >= soft_limit_mb:
         target_mb = max(MIN_TARGET_MB, soft_limit_mb - 32)
     data["retention_days"] = retention_days
     data["storage_soft_limit_mb"] = soft_limit_mb
     data["storage_target_mb"] = target_mb
+    data["text_retention_days"] = text_retention_days
     return data
 
 
@@ -178,6 +181,33 @@ def _cleanup_by_size(conn, target_bytes):
     return deleted_rows, deleted_files
 
 
+def _cleanup_strip_content(conn, text_retention_days):
+    if text_retention_days <= 0:
+        return 0, 0
+    cutoff = datetime.now(timezone.utc) - timedelta(days=text_retention_days)
+    cutoff_iso = cutoff.isoformat()
+    mf = media_folder()
+    cur = conn.cursor()
+    rows = cur.execute(
+        "SELECT id, media_path FROM messages WHERE date < ? AND (text != '' OR media_path IS NOT NULL) AND is_deleted=0",
+        (cutoff_iso,)
+    ).fetchall()
+    deleted_files = 0
+    for row_id, media_path in rows:
+        if media_path and os.path.isfile(media_path):
+            try:
+                os.remove(media_path)
+                deleted_files += 1
+            except Exception:
+                pass
+    cur.execute(
+        "UPDATE messages SET text='', media_path=NULL, media_type=NULL, sender='', username='', phone='' WHERE date < ? AND is_deleted=0",
+        (cutoff_iso,)
+    )
+    conn.commit()
+    return cur.rowcount or 0, deleted_files
+
+
 def run_cleanup(settings, logger=None, force=False):
     from common_paths import get_current_account
     acct = get_current_account() or "default"
@@ -202,13 +232,21 @@ def run_cleanup(settings, logger=None, force=False):
     conn = sqlite3.connect(db, timeout=20)
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA busy_timeout=6000;")
+        conn.execute("PRAGMA busy_timeout=10000;")
 
         rows_deleted, files_deleted = _cleanup_by_retention(conn, cfg["retention_days"])
         if rows_deleted or files_deleted:
             result["reason"].append("retention")
             result["deleted_rows"] += rows_deleted
             result["deleted_files"] += files_deleted
+
+        text_ret = cfg.get("text_retention_days", 7)
+        if text_ret > 0:
+            stripped, media_removed = _cleanup_strip_content(conn, text_ret)
+            if stripped or media_removed:
+                result["reason"].append("strip_content")
+                result["deleted_rows"] += stripped
+                result["deleted_files"] += media_removed
 
         soft_limit_bytes = cfg["storage_soft_limit_mb"] * 1024 * 1024
         target_bytes = cfg["storage_target_mb"] * 1024 * 1024

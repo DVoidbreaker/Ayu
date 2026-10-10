@@ -5,6 +5,7 @@ import base64
 import subprocess
 import time
 import signal
+import threading
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -40,36 +41,112 @@ def decode_sessions(accounts):
             print(f"[wsgi] Failed to decode session for {name}: {e}", file=sys.stderr)
 
 
-def start_receivers(accounts):
-    procs = []
-    for acct in accounts:
-        name = acct["name"]
+class ProcessManager:
+    def __init__(self):
+        self._procs = {}
+        self._lock = threading.Lock()
+        self._accounts = []
+        self._envs = {}
+
+    def start_process(self, name, cmd, env, label):
+        key = f"{name}:{label}"
+        with self._lock:
+            old = self._procs.get(key)
+            if old and old.poll() is None:
+                print(f"[watchdog] {key} still running, skipping")
+                return
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=sys.stdout,
+                    stderr=sys.stderr,
+                    env=env,
+                )
+                self._procs[key] = proc
+                print(f"[watchdog] Started {key} (pid={proc.pid})")
+            except Exception as e:
+                print(f"[watchdog] Failed to start {key}: {e}", file=sys.stderr)
+
+    def _make_env(self, acct):
         env = os.environ.copy()
-        env["AR_ACCOUNT"] = name
+        env["AR_ACCOUNT"] = acct["name"]
         env["AR_API_ID"] = str(acct.get("api_id", ""))
         env["AR_API_HASH"] = acct.get("api_hash", "")
+        return env
 
-        print(f"[wsgi] Starting receiver for account: {name}")
-        proc = subprocess.Popen(
-            [sys.executable, "-u", os.path.join(BASE_DIR, "anti_revoke.py"), name],
-            stdout=sys.stdout,
-            stderr=sys.stderr,
-            env=env,
-        )
-        procs.append(proc)
-        time.sleep(1)
+    def start_all(self, accounts):
+        self._accounts = accounts
+        for acct in accounts:
+            name = acct["name"]
+            env = self._make_env(acct)
+            self._envs[name] = env
 
-        print(f"[wsgi] Starting bot_sender for account: {name}")
-        proc_bot = subprocess.Popen(
-            [sys.executable, "-u", os.path.join(BASE_DIR, "bot_sender.py"), name],
-            stdout=sys.stdout,
-            stderr=sys.stderr,
-            env=env,
-        )
-        procs.append(proc_bot)
-        time.sleep(0.5)
+            self.start_process(
+                name,
+                [sys.executable, "-u", os.path.join(BASE_DIR, "anti_revoke.py"), name],
+                env, "receiver"
+            )
+            time.sleep(1)
+            self.start_process(
+                name,
+                [sys.executable, "-u", os.path.join(BASE_DIR, "bot_sender.py"), name],
+                env, "bot_sender"
+            )
+            time.sleep(0.5)
 
-    return procs
+    def restart_dead(self):
+        for acct in self._accounts:
+            name = acct["name"]
+            env = self._envs[name]
+
+            recv_key = f"{name}:receiver"
+            bot_key = f"{name}:bot_sender"
+
+            with self._lock:
+                recv = self._procs.get(recv_key)
+                bot = self._procs.get(bot_key)
+
+            if recv is None or recv.poll() is not None:
+                code = recv.poll() if recv else "never started"
+                print(f"[watchdog] {recv_key} died (exit={code}), restarting...")
+                self.start_process(
+                    name,
+                    [sys.executable, "-u", os.path.join(BASE_DIR, "anti_revoke.py"), name],
+                    env, "receiver"
+                )
+                time.sleep(2)
+
+            if bot is None or bot.poll() is not None:
+                code = bot.poll() if bot else "never started"
+                print(f"[watchdog] {bot_key} died (exit={code}), restarting...")
+                self.start_process(
+                    name,
+                    [sys.executable, "-u", os.path.join(BASE_DIR, "bot_sender.py"), name],
+                    env, "bot_sender"
+                )
+                time.sleep(1)
+
+    def shutdown_all(self):
+        with self._lock:
+            for key, proc in self._procs.items():
+                try:
+                    proc.terminate()
+                    print(f"[watchdog] Stopped {key}")
+                except Exception:
+                    pass
+            self._procs.clear()
+
+
+manager = ProcessManager()
+
+
+def watchdog_loop(interval=30):
+    while True:
+        time.sleep(interval)
+        try:
+            manager.restart_dead()
+        except Exception as e:
+            print(f"[watchdog] error: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
@@ -81,7 +158,11 @@ if __name__ == "__main__":
     print(f"[wsgi] Found {len(accounts)} accounts: {[a['name'] for a in accounts]}")
 
     decode_sessions(accounts)
-    procs = start_receivers(accounts)
+    manager.start_all(accounts)
+
+    watchdog = threading.Thread(target=watchdog_loop, args=(30,), daemon=True)
+    watchdog.start()
+    print("[wsgi] Watchdog started (checks every 30s)")
 
     from anti_revoke_web import create_app
 
@@ -91,11 +172,7 @@ if __name__ == "__main__":
 
     def shutdown(signum, frame):
         print("[wsgi] Shutting down...")
-        for p in procs:
-            try:
-                p.terminate()
-            except Exception:
-                pass
+        manager.shutdown_all()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
@@ -104,8 +181,4 @@ if __name__ == "__main__":
     try:
         app.run(host="0.0.0.0", port=port, debug=False)
     finally:
-        for p in procs:
-            try:
-                p.terminate()
-            except Exception:
-                pass
+        manager.shutdown_all()

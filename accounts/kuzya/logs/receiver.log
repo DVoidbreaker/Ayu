@@ -1,0 +1,27 @@
+2026-10-03T19:09:45.953996 cleanup: rows=1 files=0 usage=0.02MB reasons=strip_content
+2026-10-03T19:09:45.957578 session bootstrap failed:
+Traceback (most recent call last):
+  File "C:\Users\denia\OneDrive\Рабочий стол\Ayu 2.0\unified\anti_revoke.py", line 375, in _bootstrap_session_from_legacy
+    row = src.execute(sel_sql).fetchone()
+          ~~~~~~~~~~~^^^^^^^^^
+sqlite3.OperationalError: no such column: tmp_auth_key
+
+2026-10-03T19:09:45.958096 API_ID/API_HASH not set via AR_API_ID / AR_API_HASH env vars
+2026-10-10T11:57:43.985153 cleanup: rows=1 files=0 usage=0.02MB reasons=strip_content
+2026-10-10T11:57:43.988658 session bootstrap failed:
+Traceback (most recent call last):
+  File "C:\Users\denia\OneDrive\Рабочий стол\Ayu 2.0\unified\anti_revoke.py", line 375, in _bootstrap_session_from_legacy
+    row = src.execute(sel_sql).fetchone()
+          ~~~~~~~~~~~^^^^^^^^^
+sqlite3.OperationalError: no such column: tmp_auth_key
+
+2026-10-10T11:57:43.989469 API_ID/API_HASH not set via AR_API_ID / AR_API_HASH env vars
+2026-10-10T12:00:38.831917 cleanup: rows=1 files=0 usage=0.02MB reasons=strip_content
+2026-10-10T12:00:38.834474 session bootstrap failed:
+Traceback (most recent call last):
+  File "C:\Users\denia\OneDrive\Рабочий стол\Ayu 2.0\unified\anti_revoke.py", line 375, in _bootstrap_session_from_legacy
+    row = src.execute(sel_sql).fetchone()
+          ~~~~~~~~~~~^^^^^^^^^
+sqlite3.OperationalError: no such column: tmp_auth_key
+
+2026-10-10T12:00:38.834938 API_ID/API_HASH not set via AR_API_ID / AR_API_HASH env vars

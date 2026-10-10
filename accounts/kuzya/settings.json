@@ -1,0 +1,10 @@
+{
+  "capture_private": true,
+  "capture_group": false,
+  "capture_channel": false,
+  "download_ephemeral": true,
+  "ui_scale": 92,
+  "retention_days": 2,
+  "storage_soft_limit_mb": 150,
+  "storage_target_mb": 100
+}
