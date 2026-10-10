@@ -1,6 +1,6 @@
 # anti_revoke.py (exe-ready) - TTL fix (media.ttl_seconds)
 # Account-aware version: python anti_revoke.py <account_name>
-import os, json, sqlite3, traceback, shutil, sys, re
+import os, json, sqlite3, traceback, shutil, sys, re, inspect
 from datetime import datetime, timezone
 
 # --- account setup (must happen before any path imports) ---
@@ -43,35 +43,68 @@ DEFAULT_GUI = {
     "exclude_from_bot": [],
 }
 
-def _detect_session_cols():
-    """Detect how many columns the installed Telethon expects in sessions table."""
+def _detect_session_schema():
+    """Return [(column_name, column_ddl), ...] exactly as the installed Telethon expects
+    them in its `sessions` table (names AND order matter: Telethon unpacks SELECT * row)."""
+    probe = None
     try:
-        import inspect
-        src = inspect.getsource(telethon_sqlite.SQLiteSession.__init__)
-        for line in src.split('\n'):
-            if 'self._dc_id' in line and 'self._port' in line:
-                if 'tmp_key' in line or 'tmp_auth_key' in line:
-                    return ["dc_id", "server_address", "port", "auth_key", "tmp_auth_key", "takeout_id"]
-                return ["dc_id", "server_address", "port", "auth_key", "takeout_id"]
+        probe = telethon_sqlite.SQLiteSession()
+        rows = probe._cursor().execute("PRAGMA table_info(sessions)").fetchall()
+        cols = []
+        for row in rows:
+            name = str(row[1])
+            col_type = str(row[2] or "").strip()
+            ddl = name + (" " + col_type if col_type else "")
+            if row[5]:
+                ddl += " primary key"
+            cols.append((name, ddl))
+        if cols:
+            return cols
     except Exception:
         pass
-    return ["dc_id", "server_address", "port", "auth_key", "takeout_id"]
+    finally:
+        if probe is not None:
+            try:
+                probe.close()
+            except Exception:
+                pass
 
-def _session_cols_sql(cols):
-    """Return (create_table_sql, insert_columns, insert_placeholders, select_sql)."""
-    if len(cols) == 6:
-        return (
-            "dc_id integer primary key, server_address text, port integer, auth_key blob, tmp_auth_key blob, takeout_id integer",
-            "(dc_id, server_address, port, auth_key, tmp_auth_key, takeout_id)",
-            "(?,?,?,?,?,?)",
-            "SELECT dc_id, server_address, port, auth_key, tmp_auth_key, takeout_id FROM sessions"
-        )
-    return (
-        "dc_id integer primary key, server_address text, port integer, auth_key blob, takeout_id integer",
-        "(dc_id, server_address, port, auth_key, takeout_id)",
-        "(?,?,?,?,?)",
-        "SELECT dc_id, server_address, port, auth_key, takeout_id FROM sessions"
-    )
+    # fallback: parse the CREATE TABLE definition from Telethon source
+    try:
+        src = inspect.getsource(telethon_sqlite.SQLiteSession.__init__)
+        m = re.search(r'"""sessions\s*\((.*?)\)\s*"""', src, re.S)
+        if m:
+            cols = []
+            for part in m.group(1).split(","):
+                part = " ".join(part.split())
+                if part:
+                    cols.append((part.split()[0], part))
+            if cols:
+                return cols
+    except Exception:
+        pass
+
+    return [
+        ("dc_id", "dc_id integer primary key"),
+        ("server_address", "server_address text"),
+        ("port", "port integer"),
+        ("auth_key", "auth_key blob"),
+        ("takeout_id", "takeout_id integer"),
+        ("tmp_auth_key", "tmp_auth_key blob"),
+    ]
+
+def _detect_session_cols():
+    """Column names the installed Telethon expects in the sessions table."""
+    return [c[0] for c in _detect_session_schema()]
+
+def _session_cols_sql(schema):
+    """Return (create_table_ddl, insert_columns, insert_placeholders, select_sql)."""
+    names = [c[0] for c in schema]
+    ddl = ", ".join(c[1] for c in schema)
+    ins_cols = "(" + ", ".join(names) + ")"
+    ins_vals = "(" + ",".join(["?"] * len(names)) + ")"
+    sel_sql = "SELECT " + ", ".join(names) + " FROM sessions"
+    return ddl, ins_cols, ins_vals, sel_sql
 
 def _patch_telethon_sqlite_session():
     pass
@@ -286,7 +319,9 @@ def _repair_session_schema(session_base_val: str):
     session_path = session_base_val + ".session"
     if not os.path.exists(session_path):
         return
-    expected = _detect_session_cols()
+    schema = _detect_session_schema()
+    expected = [c[0] for c in schema]
+    current_version = int(getattr(telethon_sqlite, "CURRENT_VERSION", 0) or 0)
     src = None
     dst = None
     temp_path = session_path + ".fixed"
@@ -295,38 +330,55 @@ def _repair_session_schema(session_base_val: str):
         cur = src.cursor()
         cols = cur.execute("PRAGMA table_info(sessions)").fetchall()
         col_names = [str(c[1]) for c in cols]
-        if col_names == expected:
+        has_version = bool(cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='version'"
+        ).fetchone())
+        version = None
+        if has_version:
+            try:
+                row_v = cur.execute("SELECT version FROM version").fetchone()
+                version = int(row_v[0]) if row_v else None
+            except Exception:
+                version = None
+        if col_names == expected and has_version and version is not None and version >= current_version:
             return
-        # need to migrate
-        create_sql, ins_cols, ins_vals, sel_sql = _session_cols_sql(expected)
+
+        # need to migrate: rebuild sessions with the exact schema Telethon expects
+        create_sql, ins_cols, ins_vals, sel_sql = _session_cols_sql(schema)
         backup_path = session_path + f".bak_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         shutil.copy2(session_path, backup_path)
+
+        old_rows = cur.execute("SELECT * FROM sessions").fetchall() if col_names else []
+        old_index = {name: i for i, name in enumerate(col_names)}
+
         dst = sqlite3.connect(temp_path, timeout=10)
         src.backup(dst)
         cur = dst.cursor()
-        cur.execute("BEGIN")
-        cur.execute(f"""
-            CREATE TABLE sessions_fixed ({create_sql})
-        """)
-        if len(expected) == 6 and "tmp_auth_key" not in col_names:
-            cur.execute(f"""
-                INSERT INTO sessions_fixed {ins_cols}
-                SELECT dc_id, server_address, port, auth_key, NULL, takeout_id
-                FROM sessions
-            """)
-        elif len(expected) == 5 and "tmp_auth_key" in col_names:
-            cur.execute(f"""
-                INSERT INTO sessions_fixed {ins_cols}
-                SELECT dc_id, server_address, port, auth_key, takeout_id
-                FROM sessions
-            """)
-        else:
-            cur.execute(f"""
-                INSERT INTO sessions_fixed {ins_cols} {sel_sql}
-            """)
+        cur.execute("DROP TABLE IF EXISTS sessions_fixed")
+        cur.execute(f"CREATE TABLE sessions_fixed ({create_sql})")
+        for row in old_rows:
+            values = []
+            for name in expected:
+                idx = old_index.get(name)
+                values.append(row[idx] if idx is not None and idx < len(row) else None)
+            cur.execute(f"INSERT INTO sessions_fixed {ins_cols} VALUES {ins_vals}", values)
         cur.execute("DROP TABLE sessions")
         cur.execute("ALTER TABLE sessions_fixed RENAME TO sessions")
+
+        if current_version:
+            if not cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='version'"
+            ).fetchone():
+                cur.execute("CREATE TABLE version (version integer primary key)")
+            cur.execute("DELETE FROM version")
+            cur.execute("INSERT INTO version VALUES (?)", (current_version,))
+
         dst.commit()
+        dst.close()
+        dst = None
+        src.close()
+        src = None
+
         try:
             stale_journal = session_path + "-journal"
             if os.path.exists(stale_journal):
@@ -334,7 +386,7 @@ def _repair_session_schema(session_base_val: str):
         except Exception:
             pass
         os.replace(temp_path, session_path)
-        _log(f"session schema repaired to {len(expected)} cols, backup={os.path.basename(backup_path)}")
+        _log(f"session schema repaired to {len(expected)} cols {expected}, backup={os.path.basename(backup_path)}")
     except Exception:
         if dst is not None:
             try:
@@ -365,62 +417,20 @@ def _bootstrap_session_from_legacy(session_base_val: str, legacy_base: str):
     if os.path.exists(session_path) or not os.path.exists(legacy_path):
         return
     src = None
-    dst = None
     try:
-        os.makedirs(os.path.dirname(session_path), exist_ok=True)
         src = sqlite3.connect(f"file:{legacy_path}?mode=ro&immutable=1", uri=True, timeout=10)
-        expected = _detect_session_cols()
-        create_sql, ins_cols, ins_vals, sel_sql = _session_cols_sql(expected)
-        row = src.execute(sel_sql).fetchone()
-        if not row:
+        cols = [str(c[1]) for c in src.execute("PRAGMA table_info(sessions)").fetchall()]
+        if not cols or "auth_key" not in cols:
             return
-        dst = sqlite3.connect(session_path, timeout=10)
-        cur = dst.cursor()
-        cur.execute("CREATE TABLE version (version integer primary key)")
-        cur.execute(f"""
-            CREATE TABLE sessions ({create_sql})
-        """)
-        cur.execute("""
-            CREATE TABLE entities (
-                id integer primary key,
-                hash integer not null,
-                username text,
-                phone integer,
-                name text,
-                date integer
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE sent_files (
-                md5_digest blob,
-                file_size integer,
-                type integer,
-                id integer,
-                hash integer,
-                primary key(md5_digest, file_size, type)
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE update_state (
-                id integer primary key,
-                pts integer,
-                qts integer,
-                date integer,
-                seq integer
-            )
-        """)
-        cur.execute("INSERT INTO version VALUES (?)", (telethon_sqlite.CURRENT_VERSION,))
-        cur.execute(f"INSERT INTO sessions {ins_cols} VALUES {ins_vals}", row)
-        dst.commit()
-        _log(f"session migrated to temp storage: {session_path}")
+        row = src.execute("SELECT auth_key FROM sessions LIMIT 1").fetchone()
+        if not row or not row[0]:
+            return
+        os.makedirs(os.path.dirname(session_path), exist_ok=True)
+        shutil.copy2(legacy_path, session_path)
+        _log(f"session copied from legacy: {session_path}")
     except Exception:
         _log("session bootstrap failed:\n" + traceback.format_exc())
     finally:
-        if dst is not None:
-            try:
-                dst.close()
-            except Exception:
-                pass
         if src is not None:
             try:
                 src.close()
@@ -436,17 +446,21 @@ def _build_runtime_session():
             continue
         try:
             conn = sqlite3.connect(f"file:{session_path}?mode=ro&immutable=1", uri=True, timeout=10)
-            row = conn.execute(
-                "SELECT dc_id, server_address, port, auth_key, takeout_id FROM sessions LIMIT 1"
-            ).fetchone()
-            conn.close()
-            if not row:
+            try:
+                cols = [str(c[1]) for c in conn.execute("PRAGMA table_info(sessions)").fetchall()]
+                if "auth_key" not in cols:
+                    continue
+                row = conn.execute("SELECT auth_key FROM sessions LIMIT 1").fetchone()
+            finally:
+                conn.close()
+            if not row or not row[0]:
                 continue
             _log(f"session found at {session_path}, using SQLiteSession directly")
             return base
         except Exception:
             _log(f"runtime session load failed from {session_path}:\n" + traceback.format_exc())
     return sb
+
 
 def ensure_schema():
     conn = sqlite3.connect(db_path())
@@ -745,6 +759,8 @@ async def main():
         return
 
     runtime_base = _build_runtime_session()
+    if runtime_base != session_base():
+        _repair_session_schema(runtime_base)
     print(f"[receiver] using session base: {runtime_base}")
     print(f"[receiver] session file exists: {os.path.exists(runtime_base + '.session')}")
     sys.stdout.flush()
