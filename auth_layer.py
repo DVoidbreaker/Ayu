@@ -323,7 +323,7 @@ def process_callback(bot_token, chat_id, callback_query, trust_days, account=Non
 
     if ":" not in data:
         answer_callback_query(bot_token, query_id, "Unknown action")
-        return
+        return "unknown_action"
 
     action, request_id = data.split(":", 1)
     request_row = get_auth_request(request_id, account)
@@ -331,7 +331,7 @@ def process_callback(bot_token, chat_id, callback_query, trust_days, account=Non
         answer_callback_query(bot_token, query_id, "Request already expired")
         if message_id:
             edit_callback_message(bot_token, chat_id, message_id, "Access request expired")
-        return
+        return "expired"
 
     if action == "allow":
         trust_device(request_row["device_id"], request_row["user_agent_hash"],
@@ -343,7 +343,7 @@ def process_callback(bot_token, chat_id, callback_query, trust_days, account=Non
                 bot_token, chat_id, message_id,
                 f"Access approved\nIP: {request_row.get('ip') or 'unknown'}\nRequest ID: {request_id[:10]}",
             )
-        return
+        return "approved"
 
     if action == "deny":
         set_auth_request_status(request_id, "denied", account)
@@ -353,12 +353,27 @@ def process_callback(bot_token, chat_id, callback_query, trust_days, account=Non
                 bot_token, chat_id, message_id,
                 f"Access denied\nIP: {request_row.get('ip') or 'unknown'}\nRequest ID: {request_id[:10]}",
             )
-        return
+        return "denied"
 
     answer_callback_query(bot_token, query_id, "Unknown action")
+    return "unknown_action"
+
+
+def _clear_webhook_once(bot_token, cleared_tokens, logger):
+    if bot_token in cleared_tokens:
+        return
+    try:
+        requests.get(f"https://api.telegram.org/bot{bot_token}/deleteWebhook", timeout=10)
+    except Exception:
+        pass
+    cleared_tokens.add(bot_token)
+    logger("auth poller: webhook cleared (if any) for getUpdates")
 
 
 def poll_telegram_callbacks_for_account(account_name, config_loader, logger):
+    cleared_tokens = set()
+    logged_idle = False
+    logger(f"auth poller started for account={account_name}")
     while True:
         try:
             cfg = config_loader() or {}
@@ -368,8 +383,16 @@ def poll_telegram_callbacks_for_account(account_name, config_loader, logger):
             trust_days = int(cfg.get("trust_days") or 30)
 
             if not enabled or not bot_token or not chat_id or requests is None:
+                if not logged_idle:
+                    logger(f"auth poller idle for {account_name}: "
+                           f"enabled={enabled} token={'yes' if bot_token else 'no'} "
+                           f"chat={'yes' if chat_id else 'no'} requests={'yes' if requests else 'no'}")
+                    logged_idle = True
                 time.sleep(3)
                 continue
+            logged_idle = False
+
+            _clear_webhook_once(bot_token, cleared_tokens, logger)
 
             offset = int(get_meta("telegram_update_offset", "0", account_name) or 0)
             response = requests.get(
@@ -379,16 +402,28 @@ def poll_telegram_callbacks_for_account(account_name, config_loader, logger):
             )
             payload = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
             if response.status_code != 200 or payload.get("ok") is not True:
-                logger(f"auth poll failed: {response.status_code} {str(payload)[:200]}")
+                desc = str(payload.get("description") or response.text[:200])
+                if response.status_code == 409 or "terminated by other getUpdates" in desc:
+                    logger(f"auth poll conflict (409): another getUpdates consumer is using bot "
+                           f"(second instance, local run, or webhook). Backing off. {desc[:160]}")
+                    time.sleep(15)
+                    continue
+                logger(f"auth poll failed: {response.status_code} {desc[:200]}")
                 time.sleep(5)
                 continue
 
-            for update in payload.get("result") or []:
+            updates = payload.get("result") or []
+            if not updates:
+                time.sleep(1)
+                continue
+
+            for update in updates:
                 update_id = int(update.get("update_id") or 0)
                 set_meta("telegram_update_offset", str(update_id + 1), account_name)
                 callback_query = update.get("callback_query")
                 if callback_query:
-                    process_callback(bot_token, chat_id, callback_query, trust_days, account_name)
+                    result = process_callback(bot_token, chat_id, callback_query, trust_days, account_name)
+                    logger(f"auth callback processed account={account_name} action={result}")
         except Exception as exc:
             logger(f"auth poll error: {exc}")
             time.sleep(5)
