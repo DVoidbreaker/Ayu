@@ -1,1 +1,0 @@
-2026-10-10T12:17:20.405156 [kuzya] auth poll error: HTTPSConnectionPool(host='api.telegram.org', port=443): Read timed out. (read timeout=25)
