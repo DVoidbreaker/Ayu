@@ -6,7 +6,7 @@ try:
 except Exception:
     requests = None
 
-from flask import Flask, request, jsonify, Response, abort, send_from_directory, Blueprint
+from flask import Flask, request, jsonify, Response, abort, send_from_directory, send_file, Blueprint
 
 from auth_layer import (
     AUTH_COOKIE_NAME,
@@ -84,6 +84,13 @@ def _safe_eq(a, b):
     """Constant-time string comparison (defends against timing attacks)."""
     return hmac.compare_digest((a or "").encode("utf-8"),
                                (b or "").encode("utf-8"))
+
+
+def _unlink_quiet(path):
+    try:
+        os.unlink(path)
+    except Exception:
+        pass
 
 
 # --- In-browser Telegram login (creates the .session file) -------------------
@@ -394,7 +401,7 @@ def _save_accounts_config(cfg):
 # --- Passwords file (passwords.json) -----------------------------------------
 # Stores the three app passwords in one place. Right now all three are the
 # same value; they can be split apart later without touching call sites.
-PASSWORD_KEYS = ("secret_password", "registration_password", "deletion_password")
+PASSWORD_KEYS = ("secret_password", "registration_password", "deletion_password", "admin_password")
 
 
 def _default_passwords():
@@ -415,16 +422,29 @@ def _load_passwords():
     except Exception:
         pass
 
-    if not any(pw.values()):
+    if not any(pw.get(k) for k in ("secret_password", "registration_password", "deletion_password")):
         # No passwords file (or empty) -> migrate from the old shared password.
         legacy = _legacy_shared_password()
         if legacy:
-            pw = {k: legacy for k in PASSWORD_KEYS}
+            for k in ("secret_password", "registration_password", "deletion_password"):
+                pw[k] = legacy
             _save_passwords(pw)
     return pw
 
 
 def _save_passwords(pw):
+    # Merge: keys missing from `pw` keep their current value on disk, so a
+    # partial update (e.g. setting the shared password) never wipes others.
+    # Raw read (no _load_passwords) to avoid the migration recursion.
+    current = {}
+    try:
+        with open(PASSWORDS_CONFIG_PATH, "r", encoding="utf-8-sig") as f:
+            current = json.load(f) or {}
+    except Exception:
+        current = {}
+    for k in PASSWORD_KEYS:
+        if k not in pw and str(current.get(k) or "").strip():
+            pw[k] = current[k]
     tmp = PASSWORDS_CONFIG_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({k: str(pw.get(k, "") or "") for k in PASSWORD_KEYS}, f,
@@ -463,6 +483,53 @@ def _get_registration_password():
 def _get_deletion_password():
     pw = _load_passwords()
     return str(pw.get("deletion_password") or "").strip() or _get_shared_secret_password()
+
+
+# Default password of the global admin panel (migration/backup). Can be
+# overridden in passwords.json via the "admin_password" key.
+DEFAULT_ADMIN_PASSWORD = "uC1dyF7hoA5izT0"
+
+
+def _get_admin_password():
+    pw = _load_passwords()
+    return str(pw.get("admin_password") or "").strip() or DEFAULT_ADMIN_PASSWORD
+
+
+def _verify_admin_password(password):
+    """Gate for the global admin panel. Returns (ok, error_message)."""
+    password = (password or "").strip()
+    key = "admin:" + _client_key()
+
+    locked = _auth_locked(key)
+    if locked:
+        return False, f"Слишком много попыток. Попробуйте через {locked} сек."
+
+    if not password or not _safe_eq(password, _get_admin_password()):
+        _auth_register_fail(key)
+        time.sleep(1.0)
+        return False, "Неверный пароль"
+    _auth_clear(key)
+    return True, None
+
+
+# Short-lived admin tokens issued after a successful password check.
+_ADMIN_TOKENS = {}
+_ADMIN_TOKEN_TTL = 12 * 3600
+
+
+def _admin_issue_token():
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    # drop expired entries while we are here
+    for t in [t for t, exp in list(_ADMIN_TOKENS.items()) if exp < now]:
+        _ADMIN_TOKENS.pop(t, None)
+    _ADMIN_TOKENS[token] = now + _ADMIN_TOKEN_TTL
+    return token
+
+
+def _admin_token_ok(token):
+    exp = _ADMIN_TOKENS.get(str(token or ""))
+    return bool(exp and exp >= time.time())
 
 
 def _get_account_secret_password(account_name=None):
@@ -508,7 +575,8 @@ def _verify_selector_password(password):
             time.sleep(1.0)
             return False, "Общий пароль не задан. Придумайте пароль (минимум 4 символа)"
         _auth_clear(key)
-        _save_passwords({k: password for k in PASSWORD_KEYS})
+        _save_passwords({k: password
+                         for k in ("secret_password", "registration_password", "deletion_password")})
         return True, None
 
     if not password or not _safe_eq(password, shared):
@@ -1004,6 +1072,12 @@ p{margin:0; color:var(--muted); line-height:1.55}
   cursor:pointer; transition: background .15s, border-color .15s;
 }
 .add-btn:hover{background:rgba(84,166,255,.12); border-color:rgba(84,166,255,.5)}
+.admin-btn{
+  margin-top:10px; width:100%; padding:9px 16px; border:1px solid var(--border); border-radius:14px;
+  background:rgba(255,255,255,.02); color:var(--muted); font-size:12px; cursor:pointer;
+  transition: color .15s, border-color .15s;
+}
+.admin-btn:hover{color:var(--text); border-color:rgba(163,185,214,.4)}
 /* --- Modal overlay --- */
 .modal-overlay{
   position:fixed; inset:0; z-index:50; display:none;
@@ -1063,6 +1137,7 @@ p{margin:0; color:var(--muted); line-height:1.55}
 
     <div class="add-wrap">
       <button class="add-btn" id="addBtn" type="button">+ Добавить аккаунт</button>
+      <button class="admin-btn" id="adminBtn" type="button">Админ-панель</button>
     </div>
   </div>
 
@@ -1143,6 +1218,44 @@ p{margin:0; color:var(--muted); line-height:1.55}
         <div class="add-row">
           <button class="add-go" id="saveBotBtn" type="button">Сохранить</button>
           <button class="add-back" id="botSkipBtn" type="button">Пропустить</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Глобальная админ-панель (не привязана к аккаунту) -->
+  <div class="modal-overlay" id="adminOverlay">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="adminTitle">
+      <div class="modal-head">
+        <div class="add-title" id="adminTitle">Админ-панель</div>
+        <button class="modal-x" id="adminClose" type="button" aria-label="Закрыть">&times;</button>
+      </div>
+
+      <div class="modal-step active" id="adminUnlockStep">
+        <div class="add-title">Введите пароль администратора</div>
+        <input id="adminPwd" class="inp" type="password" placeholder="Пароль" autocomplete="off"/>
+        <div class="add-status" id="adminUnlockStatus"></div>
+        <div class="add-row">
+          <button class="add-go" id="adminLoginBtn" type="button">Войти</button>
+          <button class="add-back" id="adminCancelBtn" type="button">Отмена</button>
+        </div>
+      </div>
+
+      <div class="modal-step" id="adminPanelStep">
+        <div class="add-title">Перенос на другой хост</div>
+        <div class="add-status" id="adminAccountsInfo"></div>
+        <label class="field" style="flex-direction:row; align-items:center; gap:8px">
+          <input type="checkbox" id="adminInclMedia" style="width:auto"/>
+          Включить медиафайлы (фото/видео — архив может быть большим)
+        </label>
+        <div class="add-status" id="adminStatus"></div>
+        <div class="add-row">
+          <button class="add-go" id="adminExportBtn" type="button">Выгрузить всё (ZIP)</button>
+          <button class="add-back" id="adminLogoutBtn" type="button">Выйти</button>
+        </div>
+        <div class="add-status" style="font-size:12px">
+          В архив попадут: accounts.json, passwords.json и папки accounts/ (сессии,
+          настройки, базы, логи). Распакуйте их в корень нового хоста и перезапустите.
         </div>
       </div>
     </div>
@@ -1500,6 +1613,105 @@ $('saveBotBtn').addEventListener('click', async () => {
   }finally{
     btn.disabled = false;
   }
+});
+
+// ===================== Глобальная админ-панель =====================
+const adminOverlay = $('adminOverlay');
+const adminState = { token: '' };
+
+function adminShowStep(id){
+  ['adminUnlockStep','adminPanelStep'].forEach(s => $(s).classList.toggle('active', s === id));
+  $('adminTitle').textContent = id === 'adminUnlockStep' ? 'Админ-панель' : 'Перенос на другой хост';
+}
+function adminStatus(text, cls){ setStatus('adminStatus', text, cls); }
+
+$('adminBtn').addEventListener('click', () => {
+  adminOverlay.classList.add('open');
+  adminShowStep('adminUnlockStep');
+  setStatus('adminUnlockStatus', '', '');
+  $('adminPwd').value = '';
+  // If we still hold a valid token, jump straight to the panel.
+  if(adminState.token){ adminShowStep('adminPanelStep'); adminLoadInfo(); }
+});
+$('adminClose').addEventListener('click', () => adminOverlay.classList.remove('open'));
+$('adminCancelBtn').addEventListener('click', () => adminOverlay.classList.remove('open'));
+adminOverlay.addEventListener('click', e => { if(e.target === adminOverlay) adminOverlay.classList.remove('open'); });
+document.addEventListener('keydown', e => { if(e.key === 'Escape' && adminOverlay.classList.contains('open')) adminOverlay.classList.remove('open'); });
+
+$('adminLoginBtn').addEventListener('click', async () => {
+  const pwd = ($('adminPwd').value || '').trim();
+  if(!pwd){ setStatus('adminUnlockStatus', 'Введите пароль', 'err'); return; }
+  const btn = $('adminLoginBtn');
+  btn.disabled = true;
+  setStatus('adminUnlockStatus', 'Проверка...', '');
+  try{
+    const r = await fetch('/api/admin/login', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({password: pwd})
+    });
+    const d = await r.json();
+    if(!r.ok || !d.ok){
+      setStatus('adminUnlockStatus', d.error || 'Неверный пароль', 'err');
+      return;
+    }
+    adminState.token = d.token;
+    $('adminPwd').value = '';
+    adminShowStep('adminPanelStep');
+    adminLoadInfo();
+  }catch(e){
+    setStatus('adminUnlockStatus', e.message || 'Ошибка подключения', 'err');
+  }finally{
+    btn.disabled = false;
+  }
+});
+
+async function adminLoadInfo(){
+  const el = $('adminAccountsInfo');
+  el.textContent = 'Загрузка...';
+  try{
+    const r = await fetch('/api/admin/info?token=' + encodeURIComponent(adminState.token));
+    const d = await r.json();
+    if(!r.ok || !d.ok){
+      adminState.token = '';
+      adminShowStep('adminUnlockStep');
+      setStatus('adminUnlockStatus', d.error || 'Сессия истекла', 'err');
+      return;
+    }
+    const n = (d.accounts || []).length;
+    const noSess = (d.accounts || []).filter(a => !a.has_session);
+    let txt = 'Аккаунтов: ' + n;
+    if(noSess.length){
+      txt += ' (без сессии: ' + noSess.map(a => a.name).join(', ') + ')';
+    }
+    el.textContent = txt;
+  }catch(e){
+    el.textContent = 'Не удалось загрузить список: ' + (e.message || '');
+  }
+}
+
+$('adminExportBtn').addEventListener('click', () => {
+  if(!adminState.token){ adminShowStep('adminUnlockStep'); return; }
+  const btn = $('adminExportBtn');
+  btn.disabled = true;
+  adminStatus('Собираем архив... большие базы могут занять время.', '');
+  const media = $('adminInclMedia').checked ? '1' : '0';
+  // Direct download: browser navigates to the export URL with the token.
+  const a = document.createElement('a');
+  a.href = '/api/admin/export?token=' + encodeURIComponent(adminState.token) + '&media=' + media;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => {
+    btn.disabled = false;
+    adminStatus('Архив выгружен. Если диалог не появился — проверьте загрузки браузера.', 'ok');
+  }, 1500);
+});
+
+$('adminLogoutBtn').addEventListener('click', () => {
+  adminState.token = '';
+  adminShowStep('adminUnlockStep');
+  $('adminPwd').value = '';
+  setStatus('adminUnlockStatus', '', '');
 });
 </script>
 </body>
@@ -3532,6 +3744,77 @@ def create_app():
         if not ok:
             return jsonify({"ok": False, "error": err}), 403
         return jsonify({"ok": True})
+
+    # --- Global admin panel (not tied to any account) ----------------------
+    @app.post("/api/admin/login")
+    def api_admin_login():
+        data = request.get_json(silent=True) or {}
+        ok, err = _verify_admin_password(str(data.get("password") or ""))
+        if not ok:
+            return jsonify({"ok": False, "error": err}), 403
+        _log_for("_admin", f"admin login ip={_get_client_ip()}")
+        return jsonify({"ok": True, "token": _admin_issue_token()})
+
+    @app.get("/api/admin/info")
+    def api_admin_info():
+        if not _admin_token_ok(request.args.get("token") or request.headers.get("X-Admin-Token")):
+            return jsonify({"ok": False, "error": "Требуется вход в админ-панель"}), 403
+        accounts = []
+        for a in _get_account_list():
+            name = str(a.get("name") or "")
+            d = os.path.join(BASE_DIR, "accounts", name)
+            has_session = os.path.exists(os.path.join(d, "anti_revoke.session"))
+            accounts.append({"name": name, "api_id": a.get("api_id", ""),
+                             "has_session": has_session})
+        return jsonify({"ok": True, "accounts": accounts})
+
+    @app.get("/api/admin/export")
+    def api_admin_export():
+        token = request.args.get("token") or request.headers.get("X-Admin-Token")
+        if not _admin_token_ok(token):
+            return jsonify({"ok": False, "error": "Требуется вход в админ-панель"}), 403
+        include_media = str(request.args.get("media") or "0") == "1"
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        tmp.close()
+        written = 0
+        try:
+            with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as z:
+                for fname in ("accounts.json", "passwords.json"):
+                    p = os.path.join(BASE_DIR, fname)
+                    if os.path.exists(p):
+                        z.write(p, fname)
+                        written += 1
+                acc_root = os.path.join(BASE_DIR, "accounts")
+                if os.path.isdir(acc_root):
+                    for base, dirs, files in os.walk(acc_root):
+                        if not include_media:
+                            dirs[:] = [d for d in dirs if d != "media"]
+                        for f in files:
+                            if f.endswith((".tmp", ".bak")):
+                                continue
+                            fp = os.path.join(base, f)
+                            rel = os.path.relpath(fp, BASE_DIR)
+                            z.write(fp, rel)
+                            written += 1
+                z.writestr("README_MIGRATION.txt",
+                           "Anti-Revoke backup.\n"
+                           "1. Распакуйте contents/ в корень нового хоста\n"
+                           "   (accounts.json, passwords.json, accounts/).\n"
+                           "2. Не перезаписывайте accounts.json/passwords.json,\n"
+                           "   если на новом хосте уже есть ваши данные.\n"
+                           "3. Перезапустите приложение.\n")
+            _log_for("_admin", f"admin export: {written} files "
+                               f"media={include_media} ip={_get_client_ip()}")
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            resp = send_file(tmp.name, as_attachment=True,
+                             download_name=f"anti_revoke_backup_{stamp}.zip",
+                             mimetype="application/zip")
+            resp.call_on_close(lambda: _unlink_quiet(tmp.name))
+            return resp
+        except Exception:
+            _unlink_quiet(tmp.name)
+            raise
 
     @app.post("/api/accounts")
     def api_add_account():
