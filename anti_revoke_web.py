@@ -150,10 +150,35 @@ def _normalize_phone(raw):
 
 async def _tg_send_code(account_name, api_id, api_hash, phone):
     from telethon import TelegramClient
+    # Drop any previous login attempt for this account: a leftover connected
+    # client would keep holding the same .session file (SQLite lock) and can
+    # make the new code request silently fail.
+    await _tg_discard(account_name)
     base = _login_session_base(account_name)
     client = TelegramClient(base, int(api_id), str(api_hash))
     await client.connect()
-    sent = await client.send_code_request(phone)
+    try:
+        sent = await client.send_code_request(phone)
+    except Exception as e:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        ename = type(e).__name__
+        if "FloodWait" in ename:
+            secs = int(getattr(e, "seconds", 60) or 60)
+            mins = max(1, (secs + 59) // 60)
+            raise RuntimeError(
+                f"Telegram ограничил отправку кодов с этого адреса. "
+                f"Подождите ~{mins} мин. и запросите код заново."
+            ) from e
+        if "PhoneNumberInvalid" in ename:
+            raise RuntimeError("Номер телефона некорректен — проверьте формат.") from e
+        if "PhoneNumberBanned" in ename:
+            raise RuntimeError("Этот номер заблокирован Telegram.") from e
+        if "ApiIdInvalid" in ename:
+            raise RuntimeError("api_id/api_hash не приняты Telegram — проверьте их на my.telegram.org.") from e
+        raise
     # Where did Telegram deliver the code? For a number that is already logged
     # in on another device the code goes to the Telegram app (official chat),
     # not via SMS — tell the user so they know where to look.
@@ -1009,6 +1034,11 @@ p{margin:0; color:var(--muted); line-height:1.55}
   border-radius:14px; color:var(--text); outline:none; font-size:14px; overflow-wrap:anywhere;
 }
 .inp:focus{border-color:rgba(84,166,255,.55)}
+.api-help{
+  display:inline-block; margin:-4px 0 8px; font-size:12px; color:#5b8cff;
+  text-decoration:none; overflow-wrap:anywhere;
+}
+.api-help:hover{text-decoration:underline}
 .add-status{font-size:13px; color:var(--muted); min-height:16px; overflow-wrap:anywhere; word-break:break-word}
 .add-status.err{color:#ff8b98}
 .add-status.ok{color:var(--accent-2)}
@@ -1063,6 +1093,9 @@ p{margin:0; color:var(--muted); line-height:1.55}
         <label class="field">api_hash
           <input id="fldApiHash" class="inp" placeholder="32 символа с my.telegram.org" autocomplete="off" autocapitalize="none" spellcheck="false"/>
         </label>
+        <a class="api-help" href="https://my.telegram.org" target="_blank" rel="noopener noreferrer">
+          Получить api_id и api_hash на my.telegram.org ↗
+        </a>
         <div class="add-status" id="formStatus"></div>
         <div class="add-row">
           <button class="add-go" id="saveBtn" type="button">Добавить</button>

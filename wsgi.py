@@ -41,11 +41,45 @@ def decode_sessions(accounts):
             print(f"[wsgi] Failed to decode session for {name}: {e}", file=sys.stderr)
 
 
+def _session_has_auth(path):
+    """True if the SQLite session file exists and contains an auth_key.
+
+    A mere file check is not enough: an empty placeholder session exists but is
+    unauthorized, which used to make the watchdog start a receiver that then
+    crashed trying to log in interactively.
+    """
+    if not os.path.exists(path):
+        return False
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True, timeout=5)
+        try:
+            cols = [str(c[1]) for c in con.execute("PRAGMA table_info(sessions)").fetchall()]
+            if not cols or "auth_key" not in cols:
+                return False
+            row = con.execute("SELECT auth_key FROM sessions LIMIT 1").fetchone()
+            return bool(row and row[0])
+        finally:
+            con.close()
+    except Exception:
+        return False
+
+
 def session_is_ready(name):
     env_key = f"TG_SESSION_{name.upper()}"
     if os.environ.get(env_key, "").strip() or os.environ.get("TG_SESSION", "").strip():
         return True
-    return os.path.exists(os.path.join(BASE_DIR, "accounts", name, "anti_revoke.session"))
+    if _session_has_auth(os.path.join(BASE_DIR, "accounts", name, "anti_revoke.session")):
+        return True
+    # The receiver may run from its runtime copy in the temp dir; accept that
+    # too so a wiped/legacy-missing account does not stay stuck in "waiting".
+    try:
+        import tempfile
+        tmp = os.path.join(tempfile.gettempdir(), "AuySoft", "anti_revoke",
+                           name, "anti_revoke.session")
+        return _session_has_auth(tmp)
+    except Exception:
+        return False
 
 
 class ProcessManager:
@@ -60,8 +94,14 @@ class ProcessManager:
         if session_is_ready(name):
             return True
         if name not in self._waiting_logged:
-            print(f"[watchdog] {name}: session file not found "
-                  f"(accounts/{name}/anti_revoke.session), waiting for upload...")
+            path = os.path.join(BASE_DIR, "accounts", name, "anti_revoke.session")
+            if os.path.exists(path):
+                print(f"[watchdog] {name}: session file exists but is NOT "
+                      f"authorized (no auth_key) - log in again via the web "
+                      f"panel, waiting...")
+            else:
+                print(f"[watchdog] {name}: session file not found "
+                      f"(accounts/{name}/anti_revoke.session), waiting for login...")
             self._waiting_logged.add(name)
         return False
 

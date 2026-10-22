@@ -439,8 +439,24 @@ def _repair_session_schema(session_base_val: str):
 def _bootstrap_session_from_legacy(session_base_val: str, legacy_base: str):
     session_path = session_base_val + ".session"
     legacy_path = legacy_base + ".session"
-    if os.path.exists(session_path) or not os.path.exists(legacy_path):
+    if not os.path.exists(legacy_path):
         return
+    # If the runtime session already exists AND is authorized, keep it.
+    # (Previously any existing runtime file blocked the copy, so an empty
+    # placeholder session could never be replaced by the real authorized one.)
+    if os.path.exists(session_path):
+        try:
+            dst_probe = sqlite3.connect(f"file:{session_path}?mode=ro&immutable=1", uri=True, timeout=10)
+            try:
+                cols = [str(c[1]) for c in dst_probe.execute("PRAGMA table_info(sessions)").fetchall()]
+                if cols and "auth_key" in cols:
+                    row = dst_probe.execute("SELECT auth_key FROM sessions LIMIT 1").fetchone()
+                    if row and row[0]:
+                        return  # runtime session is already authorized
+            finally:
+                dst_probe.close()
+        except Exception:
+            pass  # broken/empty runtime session - fall through and replace it
     src = None
     try:
         src = sqlite3.connect(f"file:{legacy_path}?mode=ro&immutable=1", uri=True, timeout=10)
@@ -805,7 +821,20 @@ async def main():
 
     sys.stdout.flush()
     try:
-        await client.start()
+        # Never use interactive client.start() here: on a host there is no
+        # stdin, so an unauthorized session would prompt for a phone number and
+        # crash with EOFError in an endless restart loop. Connect explicitly and
+        # verify authorization instead.
+        await client.connect()
+        if not await client.is_user_authorized():
+            print(f"[receiver] session for account is NOT authorized "
+                  f"(no auth_key) - log in via the web panel, waiting...")
+            sys.stdout.flush()
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            return
         print(f"[receiver] client.start() completed, user: {await client.get_me()}")
     except Exception as e:
         print(f"[receiver] ERROR in client.start(): {e}")
