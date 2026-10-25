@@ -140,15 +140,22 @@ def _login_session_base(account_name):
 def _normalize_phone(raw):
     """Coerce a user-typed phone into strict international form (+<digits>).
 
-    Handles the common Russian cases: an old-style leading 8 (11 digits) is
-    rewritten to +7..., and a bare 10-digit number starting with 9 is treated
-    as +7.... Anything else just keeps its digits with a leading +.
+    Handles the common Russian cases: an old-style leading 8 for MOBILE
+    numbers (89XXXXXXXXXX, 11 digits) is rewritten to +7..., and a bare
+    10-digit number starting with 9 is treated as +7.... Anything else just
+    keeps its digits with a leading +.
+
+    The 8 -> 7 rewrite is deliberately restricted to 89... so international
+    country codes that merely start with 8 (81 Japan, 82 Korea, 84 Vietnam,
+    86 China, ...) are NOT silently turned into a different, valid Russian
+    number - that bug made Telegram deliver the login code to the wrong phone
+    for every non-Ukrainian number typed without a leading +.
     """
     p = re.sub(r"[^\d+]", "", str(raw or "").strip())
     if p.startswith("+"):
         return "+" + re.sub(r"\D", "", p)
     digits = re.sub(r"\D", "", p)
-    if len(digits) == 11 and digits.startswith("8"):
+    if len(digits) == 11 and digits.startswith("89"):
         digits = "7" + digits[1:]
     elif len(digits) == 10 and digits.startswith("9"):
         digits = "7" + digits
@@ -1984,6 +1991,17 @@ audio.media-preview{min-height:56px}
           <textarea class="input" id="b_exclude_list" rows="4" placeholder="@username&#10;+79001234567&#10;123456789" style="resize:vertical;font-family:inherit"></textarea>
         </div>
 
+        <hr style="border:none;border-top:1px solid var(--border); margin:16px 0">
+
+        <div class="small">Сессия Telegram</div>
+        <div class="small" id="sess_note" style="margin-top:6px"></div>
+        <div style="margin-top:10px">
+          <input class="input" type="file" id="sess_file" accept=".session" style="padding:8px" />
+        </div>
+        <div class="actions">
+          <button class="btn okbtn" onclick="uploadSession()">Загрузить файл сессии</button>
+        </div>
+
         <div class="actions">
           <button class="btn okbtn" onclick="saveSettings()">Сохранить</button>
           <button class="btn" onclick="loadSettings()">Обновить</button>
@@ -2272,6 +2290,28 @@ async function loadBot(){
   const exList=b.exclude_from_bot||[];
   b_exclude_list.value=exList.join('\n');
   bot_note.textContent='';
+  refreshSessionStatus();
+}
+
+/* session file upload */
+function refreshSessionStatus(){
+  fetch(PFX+'api/session/status').then(r=>r.json()).then(j=>{
+    sess_note.textContent = j.has_session
+      ? 'Сессия загружена и активна.'
+      : 'Сессии нет. Загрузите файл .session, чтобы приёмник мог запуститься.';
+  }).catch(()=>{});
+}
+
+async function uploadSession(){
+  const inp=document.getElementById('sess_file');
+  if(!inp.files || !inp.files[0]){ toast('сначала выберите файл .session'); return; }
+  const fd=new FormData();
+  fd.append('session', inp.files[0]);
+  sess_note.textContent='Загружаю и проверяю сессию...';
+  const j=await (await fetch(PFX+'api/session/upload',{method:'POST',body:fd})).json();
+  toast(j.ok?'ok':'err');
+  sess_note.textContent=j.msg||'';
+  if(j.ok) inp.value='';
 }
 
 async function testBot(){
@@ -2717,6 +2757,49 @@ document.getElementById('secret_dot').addEventListener('click',function(){
 """
 
 
+def _session_file_authorized(path):
+    """True if the SQLite session file exists and holds a non-empty auth_key."""
+    if not os.path.exists(path):
+        return False
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True, timeout=5)
+        try:
+            cols = [str(c[1]) for c in con.execute("PRAGMA table_info(sessions)").fetchall()]
+            if not cols or "auth_key" not in cols:
+                return False
+            row = con.execute("SELECT auth_key FROM sessions LIMIT 1").fetchone()
+            return bool(row and row[0])
+        finally:
+            con.close()
+    except Exception:
+        return False
+
+
+def _validate_session_file(path):
+    """Check an uploaded .session is a Telethon SQLite session with an
+    authorized auth_key. Returns (ok, error_msg)."""
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True, timeout=5)
+        try:
+            tables = {str(r[0]) for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "sessions" not in tables:
+                return False, "Это не файл сессии Telethon (нет таблицы sessions)."
+            cols = [str(c[1]) for c in con.execute("PRAGMA table_info(sessions)").fetchall()]
+            if "auth_key" not in cols:
+                return False, "В сессии нет колонки auth_key — файл неавторизован."
+            row = con.execute("SELECT auth_key FROM sessions LIMIT 1").fetchone()
+            if not row or not row[0]:
+                return False, "Сессия не авторизована (пустой auth_key). Войдите в Telegram заново."
+            return True, None
+        finally:
+            con.close()
+    except sqlite3.DatabaseError:
+        return False, "Файл не является базой SQLite (нужен .session из Telethon)."
+    except Exception as e:
+        return False, f"Ошибка чтения файла: {e}"
+
+
 def create_account_blueprint():
     """Single blueprint serving every account panel as /<account>/...
 
@@ -2888,6 +2971,59 @@ def create_account_blueprint():
         _set_ctx()
         result = run_cleanup(_load_settings(_acct()), logger=_log, force=True)
         return jsonify({"ok": True, "cleanup": result})
+
+    @bp.get("/<account>/api/session/status")
+    def api_session_status(account=None):
+        _set_ctx()
+        name = _acct()
+        persistent = os.path.join(BASE_DIR, "accounts", name, "anti_revoke.session")
+        try:
+            runtime = os.path.join(tempfile.gettempdir(), "AuySoft", "anti_revoke",
+                                   name, "anti_revoke.session")
+        except Exception:
+            runtime = persistent
+        has = _session_file_authorized(persistent) or _session_file_authorized(runtime)
+        return jsonify({"ok": True, "has_session": has})
+
+    @bp.post("/<account>/api/session/upload")
+    def api_session_upload(account=None):
+        _set_ctx()
+        name = _acct()
+        f = request.files.get("session")
+        if not f or not f.filename:
+            return jsonify({"ok": False, "msg": "Файл не выбран."}), 400
+        if not f.filename.lower().endswith(".session"):
+            return jsonify({"ok": False, "msg": "Нужен файл с расширением .session."}), 400
+
+        data = f.read()
+        if not data:
+            return jsonify({"ok": False, "msg": "Файл пуст."}), 400
+        if len(data) > 5 * 1024 * 1024:
+            return jsonify({"ok": False, "msg": "Файл слишком большой (лимит 5 MB)."}), 400
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".session")
+        try:
+            tmp.write(data)
+            tmp.close()
+            valid, err = _validate_session_file(tmp.name)
+            if not valid:
+                return jsonify({"ok": False, "msg": err}), 400
+
+            # Persist to the canonical account path the watchdog reads.
+            dest_dir = os.path.join(BASE_DIR, "accounts", name)
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, "anti_revoke.session")
+            shutil.copy2(tmp.name, dest)
+            _log(f"session uploaded ({len(data)} bytes) -> {os.path.basename(dest)}")
+            return jsonify({
+                "ok": True,
+                "msg": "Сессия загружена. Приёмник запустится автоматически (до ~30 сек)."
+            })
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
 
     @bp.get("/<account>/api/bot")
     def api_get_bot(account=None):
