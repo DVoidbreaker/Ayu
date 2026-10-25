@@ -162,7 +162,7 @@ def _normalize_phone(raw):
     return "+" + digits
 
 
-async def _tg_send_code(account_name, api_id, api_hash, phone):
+async def _tg_send_code(account_name, api_id, api_hash, phone, force_sms=False):
     from telethon import TelegramClient
     # Drop any previous login attempt for this account: a leftover connected
     # client would keep holding the same .session file (SQLite lock) and can
@@ -172,7 +172,10 @@ async def _tg_send_code(account_name, api_id, api_hash, phone):
     client = TelegramClient(base, int(api_id), str(api_hash))
     await client.connect()
     try:
-        sent = await client.send_code_request(phone)
+        # force_sms=True makes Telegram deliver by SMS instead of into the
+        # Telegram app - the fallback when the code went "в приложение" but
+        # the user cannot find it there.
+        sent = await client.send_code_request(phone, force_sms=force_sms)
     except Exception as e:
         try:
             await client.disconnect()
@@ -1209,6 +1212,7 @@ p{margin:0; color:var(--muted); line-height:1.55}
         <div class="add-row">
           <button class="add-go" id="sendCodeBtn" type="button">Отправить код</button>
           <button class="add-back" id="resendBtn" type="button" style="display:none">Отправить ещё раз</button>
+          <button class="add-back" id="smsBtn" type="button" style="display:none">По SMS</button>
           <button class="add-back" id="loginSkipBtn" type="button">Пропустить</button>
         </div>
       </div>
@@ -1466,6 +1470,7 @@ async function saveAccount(){
     $('twofaField').style.display = 'none';
     $('sendCodeBtn').textContent = 'Отправить код';
     $('resendBtn').style.display = 'none';
+    $('smsBtn').style.display = 'none';
     showStep('loginStep');
   }catch(e){
     setStatus('formStatus', e.message || 'Ошибка подключения', 'err');
@@ -1519,10 +1524,12 @@ $('sendCodeBtn').addEventListener('click', async () => {
       $('codeField').style.display = '';
       $('sendCodeBtn').textContent = 'Войти';
       $('resendBtn').style.display = '';
+      // Code went into the Telegram app -> offer an SMS fallback button.
+      $('smsBtn').style.display = (d.sent_via === 'sms') ? 'none' : '';
       const num = d.phone || phone;
       const via = d.sent_via === 'sms'
         ? 'Код отправлен по SMS на ' + num
-        : 'Код отправлен в приложение Telegram на ' + num + ' — откройте официальный чат «Telegram» и введите код оттуда.';
+        : 'Код отправлен в приложение Telegram на ' + num + ' — откройте официальный чат «Telegram». Не нашли? Нажмите «По SMS».';
       setStatus('loginStatus', via, 'ok');
     }else{
       const code = ($('fldCode').value || '').trim();
@@ -1577,6 +1584,43 @@ $('resendBtn').addEventListener('click', async () => {
       ? 'Код отправлен по SMS.'
       : 'Код отправлен в приложение Telegram — откройте официальный чат «Telegram» и введите код оттуда.';
     setStatus('loginStatus', via, 'ok');
+  }catch(e){
+    setStatus('loginStatus', e.message || 'Ошибка подключения', 'err');
+  }finally{
+    btn.disabled = false;
+  }
+});
+
+// Resend the code via SMS (force_sms) - fallback when the code went into the
+// Telegram app but the user cannot find it there.
+$('smsBtn').addEventListener('click', async () => {
+  const phone = ($('fldPhone').value || '').trim();
+  if(!phone){ setStatus('loginStatus', 'Введите номер телефона', 'err'); return; }
+  const btn = $('smsBtn');
+  btn.disabled = true;
+  setStatus('loginStatus', 'Отправляем код по SMS…', '');
+  try{
+    const r = await fetch('/api/session/start', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({password: addState.password, name: addState.name, phone, force_sms: true})
+    });
+    const d = await r.json();
+    if(!r.ok || !d.ok){
+      setStatus('loginStatus', d.error || 'Не удалось отправить код', 'err');
+      if(r.status === 403){ addState.password=''; showStep('unlockStep'); }
+      return;
+    }
+    $('twofaField').style.display = 'none';
+    $('fld2fa').value = '';
+    $('codeField').style.display = '';
+    $('sendCodeBtn').textContent = 'Войти';
+    $('resendBtn').style.display = '';
+    const num = d.phone || phone;
+    setStatus('loginStatus',
+      d.sent_via === 'sms'
+        ? 'Код отправлен по SMS на ' + num + ' — ждите сообщение.'
+        : 'Telegram всё равно отправил в приложение на ' + num + '. Откройте официальный чат «Telegram».',
+      'ok');
   }catch(e){
     setStatus('loginStatus', e.message || 'Ошибка подключения', 'err');
   }finally{
@@ -4024,12 +4068,17 @@ def create_app():
         if not api_id or not api_hash:
             return jsonify({"ok": False, "error": "У аккаунта нет api_id/api_hash"}), 400
 
+        # Optional: user clicks "resend via SMS" -> force SMS delivery instead
+        # of dropping the code into the Telegram app.
+        force_sms = str(data.get("force_sms") or "").lower() in ("1", "true", "yes")
+
         try:
-            via = _run_login_coro(_tg_send_code(name, api_id, api_hash, phone), timeout=90)
+            via = _run_login_coro(_tg_send_code(name, api_id, api_hash, phone, force_sms=force_sms),
+                                 timeout=90)
         except Exception as e:
             return jsonify({"ok": False, "error": f"Не удалось отправить код: {e}"}), 502
 
-        _log_for(name, f"session login: code requested via={via} phone={phone} ip={_get_client_ip()}")
+        _log_for(name, f"session login: code requested via={via} phone={phone} force_sms={force_sms} ip={_get_client_ip()}")
         return jsonify({"ok": True, "need": "code", "sent_via": via, "phone": phone})
 
     @app.post("/api/session/verify")
