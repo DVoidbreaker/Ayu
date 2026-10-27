@@ -1,0 +1,13 @@
+{
+  "secret_password": "",
+  "accounts": [
+    {
+      "name": "ww",
+      "api_id": 11487133,
+      "api_hash": "6073668c6ef9454a004daaff211071b2",
+      "secret_password": "pbkdf2_sha256$390000$50a9d093ed536bcc47b20b18e0e9fe8c$e644701427b44a1ff0661106698c1d9d416a5fd48453b9da68bff8cae00fce2c",
+      "secret_bot_token": "",
+      "secret_bot_chat_id": ""
+    }
+  ]
+}
