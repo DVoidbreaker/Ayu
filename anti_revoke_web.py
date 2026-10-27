@@ -318,102 +318,12 @@ async def _tg_sign_in(account_name, code, password_2fa):
 async def _tg_discard(account_name):
     with _LOGIN_LOCK:
         st = _LOGIN_STATES.pop(account_name, None)
-    if st and st.get("qr_task"):
-        # Cancel a still-waitng QR waiter so it doesn't hang on a dead client.
-        try:
-            st["qr_task"].cancel()
-        except Exception:
-            pass
     if st and st.get("client"):
         try:
             await st["client"].disconnect()
         except Exception:
             pass
 
-
-async def _tg_qr_start(account_name, api_id, api_hash):
-    """Begin a QR login: connect, mint a login token, and start waiting for it
-    to be scanned by an already-authorized Telegram client (e.g. the phone that
-    is already logged into this number).
-
-    Returns the tg://login?token=... URL to be rendered as a QR code. The actual
-    authorization happens in a background task that keeps running on the shared
-    login loop while the user scans the code.
-    """
-    from telethon import TelegramClient
-    await _tg_discard(account_name)
-    base = _login_session_base(account_name)
-    client = TelegramClient(base, int(api_id), str(api_hash))
-    await client.connect()
-    try:
-        qr = await client.qr_login()
-    except Exception as e:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-        ename = type(e).__name__
-        if "FloodWait" in ename:
-            secs = int(getattr(e, "seconds", 60) or 60)
-            mins = max(1, (secs + 59) // 60)
-            raise RuntimeError(
-                f"Telegram ограничил вход с этого адреса. Подождите ~{mins} мин."
-            ) from e
-        if "ApiIdInvalid" in ename:
-            raise RuntimeError(
-                "api_id/api_hash не приняты Telegram — проверьте их на my.telegram.org."
-            ) from e
-        raise
-
-    async def _waiter():
-        try:
-            user = await qr.wait()  # blocks (via UpdateLoginToken) until scanned
-            return ("done", user)
-        except asyncio.TimeoutError:
-            return ("expired", None)
-        except Exception as e:
-            return ("error", e)
-
-    # Fire-and-forget: this task lives on the login loop until the QR is scanned
-    # or the token expires. _tg_qr_status polls it without blocking.
-    task = asyncio.ensure_future(_waiter())
-    with _LOGIN_LOCK:
-        _LOGIN_STATES[account_name] = {
-            "client": client,
-            "mode": "qr",
-            "qr_task": task,
-        }
-    return qr.url
-
-
-async def _tg_qr_status(account_name):
-    """Non-blocking check of QR login progress.
-
-    Returns one of: "none" (no QR started), "pending" (waiting to be scanned),
-    "done" (authorized - session already saved to disk), "expired" (token
-    expired - caller should restart), "error" (login failed).
-    """
-    with _LOGIN_LOCK:
-        st = _LOGIN_STATES.get(account_name)
-    if not st or st.get("mode") != "qr":
-        return "none"
-    task = st.get("qr_task")
-    if task is None or not task.done():
-        return "pending"
-    try:
-        result = task.result()
-    except Exception:
-        result = ("error", None)
-    kind = result[0]
-    # Task finished - drop the client. On success the auth key is already in the
-    # .session file, so nothing is lost by disconnecting.
-    try:
-        await st["client"].disconnect()
-    except Exception:
-        pass
-    with _LOGIN_LOCK:
-        _LOGIN_STATES.pop(account_name, None)
-    return kind
 
 def _load_accounts_config():
     try:
@@ -1473,17 +1383,9 @@ p{margin:0; color:var(--muted); line-height:1.55}
         <label class="field" id="twofaField" style="display:none">Пароль двухфакторной защиты
           <input id="fld2fa" class="inp" type="password" placeholder="Пароль 2FA" autocomplete="off"/>
         </label>
-        <div id="qrPanel" style="display:none;text-align:center">
-          <div id="qrBox" style="display:inline-block;background:#fff;padding:10px;border-radius:10px"></div>
-          <div style="font-size:12px;opacity:.85;margin-top:6px;text-align:left">
-            Отсканируйте код телефоном, где уже залогинен этот номер:
-            Telegram → Настройки → Устройства → Подключить устройство → Сканировать QR-код.
-          </div>
-        </div>
         <div class="add-status" id="loginStatus"></div>
         <div class="add-row">
           <button class="add-go" id="sendCodeBtn" type="button">Отправить код</button>
-          <button class="add-back" id="qrBtn" type="button">Войти по QR</button>
           <button class="add-back" id="resendBtn" type="button" style="display:none">Отправить ещё раз</button>
           <button class="add-back" id="loginSkipBtn" type="button">Пропустить</button>
         </div>
@@ -1543,7 +1445,6 @@ p{margin:0; color:var(--muted); line-height:1.55}
       </div>
     </div>
   </div>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script>
 const ACCOUNTS = __ACCOUNTS_JSON__;
 const list = document.getElementById('accountsList');
@@ -1741,9 +1642,6 @@ async function saveAccount(){
     $('twofaField').style.display = 'none';
     $('sendCodeBtn').textContent = 'Отправить код';
     $('resendBtn').style.display = 'none';
-    $('qrPanel').style.display = 'none';
-    $('qrBox').innerHTML = '';
-    stopQrPolling();
     showStep('loginStep');
   }catch(e){
     setStatus('formStatus', e.message || 'Ошибка подключения', 'err');
@@ -1800,7 +1698,7 @@ $('sendCodeBtn').addEventListener('click', async () => {
       const num = d.phone || phone;
       const via = d.sent_via === 'sms'
         ? 'Код отправлен по SMS на ' + num
-        : 'Код ушёл в приложение Telegram на ' + num + ' (официальный чат «Telegram»). Не видите код? Нажмите «Войти по QR».';
+        : 'Код ушёл в приложение Telegram на ' + num + ' (официальный чат «Telegram»).';
       setStatus('loginStatus', via, 'ok');
     }else{
       const code = ($('fldCode').value || '').trim();
@@ -1856,85 +1754,6 @@ $('resendBtn').addEventListener('click', async () => {
       : 'Код отправлен в приложение Telegram — откройте официальный чат «Telegram» и введите код оттуда.';
     setStatus('loginStatus', via, 'ok');
   }catch(e){
-    setStatus('loginStatus', e.message || 'Ошибка подключения', 'err');
-  }finally{
-    btn.disabled = false;
-  }
-});
-
-// --- QR login: the reliable path when the number is already logged in on a
-// phone. The user scans the code with that phone; no SMS/code needed. ---
-var qrPollTimer = null;
-
-function stopQrPolling(){
-  if(qrPollTimer){ clearInterval(qrPollTimer); qrPollTimer = null; }
-}
-
-function renderQr(url){
-  var box = $('qrBox');
-  box.innerHTML = '';
-  if(typeof QRCode !== 'undefined'){
-    new QRCode(box, {text: url, width: 220, height: 220, correctLevel: QRCode.CorrectLevel.M});
-  }else{
-    // QR library failed to load (e.g. CDN unreachable) -> show the raw URL.
-    var p = document.createElement('div');
-    p.style.cssText = 'color:#000;font-size:11px;max-width:230px;word-break:break-all;text-align:left';
-    p.textContent = url;
-    box.appendChild(p);
-  }
-}
-
-async function pollQr(){
-  try{
-    var r = await fetch('/api/session/qr/status', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({password: addState.password, name: addState.name})
-    });
-    var d = await r.json();
-    if(!r.ok || !d.ok){
-      if(r.status === 403){ stopQrPolling(); addState.password=''; showStep('unlockStep'); }
-      return;
-    }
-    if(d.state === 'done'){
-      stopQrPolling();
-      goBotStep();
-    }else if(d.state === 'expired'){
-      stopQrPolling();
-      $('qrPanel').style.display = 'none';
-      setStatus('loginStatus', 'QR-код истёк — нажмите «Войти по QR» ещё раз.', 'err');
-    }else if(d.state === 'error'){
-      stopQrPolling();
-      $('qrPanel').style.display = 'none';
-      setStatus('loginStatus', 'Не удалось войти по QR — войдите по коду или повторите.', 'err');
-    }
-    // 'pending' -> keep polling
-  }catch(e){ /* transient network hiccup; keep polling */ }
-}
-
-$('qrBtn').addEventListener('click', async () => {
-  var btn = $('qrBtn');
-  btn.disabled = true;
-  stopQrPolling();
-  $('qrPanel').style.display = '';
-  $('qrBox').innerHTML = '';
-  setStatus('loginStatus', 'Создаём QR-код…', '');
-  try{
-    var r = await fetch('/api/session/qr/start', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({password: addState.password, name: addState.name})
-    });
-    var d = await r.json();
-    if(!r.ok || !d.ok){
-      $('qrPanel').style.display = 'none';
-      setStatus('loginStatus', d.error || 'Не удалось создать QR-код', 'err');
-      if(r.status === 403){ addState.password=''; showStep('unlockStep'); }
-      return;
-    }
-    renderQr(d.url);
-    setStatus('loginStatus', 'Отсканируйте QR-код телефоном…', 'ok');
-    qrPollTimer = setInterval(pollQr, 2500);
-  }catch(e){
-    $('qrPanel').style.display = 'none';
     setStatus('loginStatus', e.message || 'Ошибка подключения', 'err');
   }finally{
     btn.disabled = false;
@@ -4538,51 +4357,6 @@ def create_app():
                 "Приёмник сообщений подключится в течение ~30 секунд."
             ),
         })
-
-    # --- QR login: start a token + start the background waiter -------------
-    @app.post("/api/session/qr/start")
-    def api_session_qr_start():
-        data = request.get_json(silent=True) or {}
-        ok, err = _verify_selector_password(str(data.get("password") or ""))
-        if not ok:
-            return jsonify({"ok": False, "error": err}), 403
-
-        name = str(data.get("name") or "").strip().lower()
-        acct = _find_account(name)
-        if not acct:
-            return jsonify({"ok": False, "error": "Аккаунт не найден. Сначала добавьте аккаунт."}), 404
-
-        api_id = acct.get("api_id")
-        api_hash = acct.get("api_hash")
-        if not api_id or not api_hash:
-            return jsonify({"ok": False, "error": "У аккаунта нет api_id/api_hash"}), 400
-
-        try:
-            url = _run_login_coro(_tg_qr_start(name, api_id, api_hash), timeout=90)
-        except Exception as e:
-            return jsonify({"ok": False, "error": f"Не удалось создать QR-код: {e}"}), 502
-
-        _log_for(name, f"session login: QR requested ip={_get_client_ip()}")
-        return jsonify({"ok": True, "url": url})
-
-    # --- QR login: poll whether the code has been scanned ------------------
-    @app.post("/api/session/qr/status")
-    def api_session_qr_status():
-        data = request.get_json(silent=True) or {}
-        ok, err = _verify_selector_password(str(data.get("password") or ""))
-        if not ok:
-            return jsonify({"ok": False, "error": err}), 403
-
-        name = str(data.get("name") or "").strip().lower()
-        if not _find_account(name):
-            return jsonify({"ok": False, "error": "Аккаунт не найден"}), 404
-
-        try:
-            state = _run_login_coro(_tg_qr_status(name), timeout=30)
-        except Exception as e:
-            return jsonify({"ok": False, "error": f"Ошибка проверки QR: {e}"}), 502
-
-        return jsonify({"ok": True, "state": state})
 
     # --- Save secret bot credentials (token + chat id) for an account -----
     @app.post("/api/accounts/secret-bot")
