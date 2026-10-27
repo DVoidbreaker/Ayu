@@ -185,16 +185,26 @@ def _login_session_base(account_name):
 def _normalize_phone(raw):
     """Coerce a user-typed phone into strict international form (+<digits>).
 
-    Handles the common Russian cases: an old-style leading 8 for MOBILE
-    numbers (89XXXXXXXXXX, 11 digits) is rewritten to +7..., and a bare
-    10-digit number starting with 9 is treated as +7.... Anything else just
-    keeps its digits with a leading +.
+    If the number already carries a leading "+" (with or without spaces,
+    dashes, parentheses typed around it), it is trusted as-is and only
+    cleaned up - no country is ever guessed for it. Country-guessing only
+    kicks in for a number typed *without* a "+", and is intentionally
+    narrow (exact digit-count + prefix) so it never reinterprets a number
+    that is already a valid, different country's number:
 
-    The 8 -> 7 rewrite is deliberately restricted to 89... so international
-    country codes that merely start with 8 (81 Japan, 82 Korea, 84 Vietnam,
-    86 China, ...) are NOT silently turned into a different, valid Russian
-    number - that bug made Telegram deliver the login code to the wrong phone
-    for every non-Ukrainian number typed without a leading +.
+      Russia    89XXXXXXXXX (11 digits) / 9XXXXXXXXX (10 digits)  -> +7...
+      Ukraine   80XXXXXXXXX (11 digits) / 0XXXXXXXXX (10 digits)  -> +380...
+
+    BUG FIX: Ukrainian numbers typed in their local form - e.g. the common
+    "0501234567" (10 digits, national trunk "0") or the older
+    "80501234567" (11 digits, Soviet-style "8" trunk prefix, analogous to
+    the Russian 89... convention) - used to fall through to the generic
+    "just add a +" path, producing "+0501234567" / "+80501234567": not a
+    real number, so Telegram either rejected it outright or simply never
+    delivered a code. Only +7/+380 are special-cased on purpose; any other
+    country typed without a "+" is left as typed (digits only, "+" in
+    front) rather than guessed, since guessing wrong silently sends the
+    code to a different, unrelated number.
     """
     p = re.sub(r"[^\d+]", "", str(raw or "").strip())
     if p.startswith("+"):
@@ -204,6 +214,10 @@ def _normalize_phone(raw):
         digits = "7" + digits[1:]
     elif len(digits) == 10 and digits.startswith("9"):
         digits = "7" + digits
+    elif len(digits) == 11 and digits.startswith("80"):
+        digits = "380" + digits[2:]
+    elif len(digits) == 10 and digits.startswith("0"):
+        digits = "380" + digits[1:]
     return "+" + digits
 
 
