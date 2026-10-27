@@ -10,15 +10,23 @@ def _get_account():
         sys.exit(1)
     return sys.argv[1]
 
-def _account_dir(name):
-    d = os.path.join(ACCOUNTS_DIR, name)
-    os.makedirs(d, exist_ok=True)
+def _secure_dir(d):
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except Exception:
+        pass
     return d
 
+def _account_dir(name):
+    d = os.path.join(ACCOUNTS_DIR, name)
+    return _secure_dir(d)
+
 def _session_dir(name):
+    # Telethon .session files hold the auth_key (= a live login token for
+    # the Telegram account) - never leave this world-readable.
     d = os.path.join(tempfile.gettempdir(), "AuySoft", "anti_revoke", name)
-    os.makedirs(d, exist_ok=True)
-    return d
+    return _secure_dir(d)
 
 def _session_base(name):
     return os.path.join(_session_dir(name), "anti_revoke")
@@ -31,8 +39,7 @@ def _db_path(name):
 
 def _media_folder(name):
     d = os.path.join(_account_dir(name), "media", "anti_revoke")
-    os.makedirs(d, exist_ok=True)
-    return d
+    return _secure_dir(d)
 
 def _bootstrap_session(name):
     legacy = _legacy_session_base(name) + ".session"
@@ -40,6 +47,13 @@ def _bootstrap_session(name):
     if os.path.exists(legacy) and not os.path.exists(runtime):
         import shutil
         shutil.copy2(legacy, runtime)
+    try:
+        if os.path.exists(runtime):
+            os.chmod(runtime, 0o600)
+        if os.path.exists(legacy):
+            os.chmod(legacy, 0o600)
+    except Exception:
+        pass
 
 def _load_api_creds(name):
     accounts_file = os.path.join(ACCOUNTS_DIR, "..", "accounts.json")

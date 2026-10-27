@@ -1,4 +1,5 @@
 import os, re, sys, json, sqlite3, subprocess, time, shutil, tempfile, zipfile, secrets, hmac, asyncio, threading
+import hashlib, binascii
 from datetime import datetime
 
 try:
@@ -84,6 +85,50 @@ def _safe_eq(a, b):
     """Constant-time string comparison (defends against timing attacks)."""
     return hmac.compare_digest((a or "").encode("utf-8"),
                                (b or "").encode("utf-8"))
+
+
+# --- Password hashing ---------------------------------------------------
+# SECURITY FIX: passwords.json used to store every password (secret,
+# registration, deletion, admin) in plain text on disk. Anyone who can read
+# that one file (a misconfigured volume, a backup, a Docker image layer
+# that accidentally included it, another local process) recovers every
+# password immediately. Passwords are now salted + hashed with PBKDF2-HMAC
+# (stdlib `hashlib`, no extra dependency) and only the hash is ever
+# persisted; legacy plain-text values are transparently migrated to hashes
+# the first time they are read.
+_PBKDF2_ALGO = "pbkdf2_sha256"
+_PBKDF2_ITERATIONS = 390_000
+
+
+def _hash_password(password):
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", (password or "").encode("utf-8"), salt, _PBKDF2_ITERATIONS)
+    return f"{_PBKDF2_ALGO}${_PBKDF2_ITERATIONS}${binascii.hexlify(salt).decode()}${binascii.hexlify(dk).decode()}"
+
+
+def _is_hashed_password(value):
+    return isinstance(value, str) and value.startswith(_PBKDF2_ALGO + "$")
+
+
+def _verify_password(password, stored):
+    """Compare a user-supplied password against a stored value. Supports
+    both the new hashed format and (defensively) a legacy plain-text value,
+    so verification never breaks while a password.json is mid-migration."""
+    stored = stored or ""
+    if not password:
+        return False
+    if not _is_hashed_password(stored):
+        # Not yet migrated (should be rare - _load_passwords migrates on
+        # read) - fall back to a constant-time plain comparison.
+        return _safe_eq(password, stored)
+    try:
+        _algo, iterations, salt_hex, hash_hex = stored.split("$")
+        salt = binascii.unhexlify(salt_hex)
+        expected = binascii.unhexlify(hash_hex)
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iterations))
+        return hmac.compare_digest(dk, expected)
+    except Exception:
+        return False
 
 
 def _unlink_quiet(path):
@@ -511,13 +556,32 @@ def _default_passwords():
 
 def _load_passwords():
     """Read passwords.json. If missing/empty, seed it from the legacy shared
-    password in accounts.json so existing installs keep working."""
+    password in accounts.json so existing installs keep working.
+
+    SECURITY FIX: any plain-text password found on disk (from an older
+    version of this app, or from a hand-edited file) is transparently
+    re-hashed and persisted here, so passwords.json converges to
+    hashed-only storage without any manual migration step."""
     pw = _default_passwords()
+    changed = False
     try:
         with open(PASSWORDS_CONFIG_PATH, "r", encoding="utf-8-sig") as f:
             data = json.load(f) or {}
         for k in PASSWORD_KEYS:
-            pw[k] = str(data.get(k) or "").strip()
+            raw = str(data.get(k) or "").strip()
+            if k == "admin_password" and raw == _LEAKED_DEFAULT_ADMIN_PASSWORD:
+                # SECURITY: this exact value was hard-coded in the source
+                # (and is now publicly known / documented in the security
+                # audit). Never migrate it as-is, even hashed - treat it as
+                # unset so _ensure_admin_password_initialized() mints a
+                # brand-new random one instead of perpetuating a leaked
+                # credential.
+                raw = ""
+                changed = True
+            elif raw and not _is_hashed_password(raw):
+                raw = _hash_password(raw)
+                changed = True
+            pw[k] = raw
     except FileNotFoundError:
         pass
     except Exception:
@@ -527,9 +591,13 @@ def _load_passwords():
         # No passwords file (or empty) -> migrate from the old shared password.
         legacy = _legacy_shared_password()
         if legacy:
+            hashed = _hash_password(legacy)
             for k in ("secret_password", "registration_password", "deletion_password"):
-                pw[k] = legacy
-            _save_passwords(pw)
+                pw[k] = hashed
+            changed = True
+
+    if changed:
+        _save_passwords(pw)
     return pw
 
 
@@ -586,14 +654,41 @@ def _get_deletion_password():
     return str(pw.get("deletion_password") or "").strip() or _get_shared_secret_password()
 
 
-# Default password of the global admin panel (migration/backup). Can be
-# overridden in passwords.json via the "admin_password" key.
-DEFAULT_ADMIN_PASSWORD = "uC1dyF7hoA5izT0"
+# SECURITY: this was the hard-coded default admin password shipped in the
+# source code (and now also documented in the security audit) - it must
+# never be treated as a valid/current password again, see _load_passwords().
+_LEAKED_DEFAULT_ADMIN_PASSWORD = "uC1dyF7hoA5izT0"
+
+# SECURITY FIX: there used to be a hard-coded default admin password here
+# ("uC1dyF7hoA5izT0"), published in the source code, that unlocked
+# `/api/admin/export` - a full dump of accounts.json, passwords.json and
+# every account's live Telegram .session file (= account takeover) for
+# anyone who had ever seen this file and whose operator never changed it.
+# A random admin password is now generated and hashed into passwords.json
+# on first startup (see `_ensure_admin_password_initialized`, called from
+# `create_app()`); there is no built-in fallback value any more.
 
 
 def _get_admin_password():
     pw = _load_passwords()
-    return str(pw.get("admin_password") or "").strip() or DEFAULT_ADMIN_PASSWORD
+    return str(pw.get("admin_password") or "").strip()
+
+
+def _ensure_admin_password_initialized():
+    """Generate a random admin password on first run and print it once.
+    Idempotent: does nothing once passwords.json already has one."""
+    pw = _load_passwords()
+    if pw.get("admin_password"):
+        return
+    generated = secrets.token_urlsafe(24)
+    pw["admin_password"] = _hash_password(generated)
+    _save_passwords(pw)
+    print("=" * 72)
+    print("[SECURITY] Сгенерирован пароль админ-панели (/api/admin/*):")
+    print(f"[SECURITY]   {generated}")
+    print("[SECURITY] Он хранится только в виде хеша и повторно показан не будет.")
+    print("[SECURITY] Сохраните его в надёжном месте (например, в менеджере паролей).")
+    print("=" * 72)
 
 
 def _verify_admin_password(password):
@@ -605,7 +700,14 @@ def _verify_admin_password(password):
     if locked:
         return False, f"Слишком много попыток. Попробуйте через {locked} сек."
 
-    if not password or not _safe_eq(password, _get_admin_password()):
+    admin_hash = _get_admin_password()
+    if not admin_hash:
+        # Should not happen in normal operation (initialized at startup),
+        # but never fail open: with no admin password configured, admin
+        # login is refused outright rather than silently allowed.
+        return False, "Пароль администратора не настроен. Обратитесь к оператору сервиса."
+
+    if not password or not _verify_password(password, admin_hash):
         _auth_register_fail(key)
         time.sleep(1.0)
         return False, "Неверный пароль"
@@ -643,17 +745,33 @@ def _selector_password_state():
     return {
         "accounts": len(accounts),
         "password_exists": bool(shared),
-        # No accounts and no password yet -> a fresh install: the first
-        # account can be added without a password.
-        "password_required": bool(shared) or bool(accounts),
+        # SECURITY FIX: this used to be False on a fresh install (no
+        # accounts yet, no password set), which made the frontend skip the
+        # password step entirely for the very first account - so the first
+        # profile created through the site was reachable by anyone, with no
+        # password and no authentication whatsoever. A password must always
+        # be set (or entered) before any account is created or managed.
+        "password_required": True,
     }
 
 
-def _verify_selector_password(password):
-    """Gate for adding a new account. Returns (ok, error_message).
+_MIN_NEW_PASSWORD_LEN = 8
 
-    Hardened: per-IP lockout after repeated failures and constant-time
-    comparison of the shared password.
+
+def _verify_selector_password(password):
+    """Gate for adding/managing accounts from the selector. Returns
+    (ok, error_message).
+
+    SECURITY FIX: this used to return `True` unconditionally for the very
+    first account on a fresh install (no password check of any kind), and
+    then let *any* unauthenticated visitor's *next* request silently become
+    the permanent shared password once one account existed - a takeover
+    race, and the root cause of "a newly created profile is reachable by
+    anyone with no password". Now a real password (>= 8 chars) must be
+    supplied and is persisted atomically in the very same request that
+    establishes it, whether that is the first account ever or a recovery
+    after passwords.json was lost - there is no longer a window in which an
+    account exists without a password protecting it.
     """
     password = (password or "").strip()
     key = _client_key()
@@ -663,24 +781,19 @@ def _verify_selector_password(password):
         return False, f"Слишком много попыток. Попробуйте через {locked} сек."
 
     shared = _get_registration_password()
-    accounts = _get_account_list()
-
-    if not shared and not accounts:
-        return True, None  # fresh install, first account
 
     if not shared:
-        # Accounts already exist but the common password was never set:
-        # the first entered password becomes the common one.
-        if len(password) < 4:
+        if len(password) < _MIN_NEW_PASSWORD_LEN:
             _auth_register_fail(key)
             time.sleep(1.0)
-            return False, "Общий пароль не задан. Придумайте пароль (минимум 4 символа)"
+            return False, f"Общий пароль не задан. Придумайте пароль (минимум {_MIN_NEW_PASSWORD_LEN} символов)"
         _auth_clear(key)
-        _save_passwords({k: password
+        hashed = _hash_password(password)
+        _save_passwords({k: hashed
                          for k in ("secret_password", "registration_password", "deletion_password")})
         return True, None
 
-    if not password or not _safe_eq(password, shared):
+    if not password or not _verify_password(password, shared):
         _auth_register_fail(key)
         time.sleep(1.0)
         return False, "Неверный пароль"
@@ -703,7 +816,7 @@ def _verify_deletion_password(password):
         # Fresh install with no password yet: nothing to delete anyway.
         return False, "Пароль удаления не задан"
 
-    if not password or not _safe_eq(password, target):
+    if not password or not _verify_password(password, target):
         _auth_register_fail(key)
         time.sleep(1.0)
         return False, "Неверный пароль"
@@ -717,13 +830,20 @@ def _get_account_bot_credentials(account_name):
     return "", ""
 
 def _is_access_control_enabled(account_name):
+    """Whether the account panel requires a trusted-device cookie to be seen.
+
+    SECURITY FIX: this used to additionally require a configured Telegram
+    bot (bot_token + access_chat_id). That meant every freshly created
+    account - before its owner had gone and set up Telegram-based login
+    approval - was reachable by *anyone* who knew (or guessed) its URL,
+    with no password and no login of any kind: `_request_has_access()`
+    short-circuits to "allowed" whenever this function returns False.
+    Password-based login (`/api/auth/password_login`) never depended on the
+    bot being configured, so access control must stay enabled by default
+    regardless of whether the optional Telegram-bot approval flow is set up.
+    """
     cfg = _load_gui_cfg(account_name)
-    return bool(
-        cfg.get("access_control_enabled", True)
-        and (cfg.get("bot_token") or "").strip()
-        and (cfg.get("access_chat_id") or cfg.get("bot_chat_id") or "").strip()
-        and (cfg.get("auth_secret") or "").strip()
-    )
+    return bool(cfg.get("access_control_enabled", True))
 
 def _get_client_ip():
     forwarded = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
@@ -762,6 +882,46 @@ def _attach_access_cookie(resp, device_hash, trust_days, path_prefix, account_na
 def _clear_access_cookies(resp, path_prefix):
     resp.delete_cookie(AUTH_COOKIE_NAME, path=f"/{path_prefix}/")
     resp.delete_cookie(DEVICE_COOKIE_NAME, path=f"/{path_prefix}/")
+
+
+# --- "Secret" sub-panel access -----------------------------------------------
+# SECURITY FIX: the secret password used to be embedded in plain text in the
+# page's HTML/JS and compared in the browser (`SECRET_PWD`), and none of the
+# /<account>/api/secret/* endpoints checked anything beyond the *general*
+# panel login. That meant the second factor protecting the most sensitive
+# actions (reading/deleting/editing real Telegram messages, downloading
+# media, dumping full chat history) did not exist server-side at all.
+#
+# Now a correct password issues a short-lived, signed, httponly cookie
+# (same mechanism as the main access cookie) and every /secret/* route is
+# gated on it in `_bp_before_request`.
+SECRET_COOKIE_NAME = "ar_secret"
+SECRET_UNLOCK_TTL_SEC = 30 * 60  # 30 minutes
+
+
+def _attach_secret_cookie(resp, account_name):
+    cfg = _load_gui_cfg(account_name)
+    token = create_access_token(cfg["auth_secret"], f"secret:{account_name}")
+    resp.set_cookie(
+        SECRET_COOKIE_NAME,
+        token,
+        max_age=SECRET_UNLOCK_TTL_SEC,
+        httponly=True,
+        secure=_should_use_secure_cookie(),
+        samesite="Lax",
+        path=f"/{account_name}/",
+    )
+
+
+def _secret_unlocked(account_name):
+    cfg = _load_gui_cfg(account_name)
+    token = request.cookies.get(SECRET_COOKIE_NAME)
+    payload = parse_access_token(cfg["auth_secret"], token)
+    return payload == f"secret:{account_name}"
+
+
+def _clear_secret_cookie(resp, path_prefix):
+    resp.delete_cookie(SECRET_COOKIE_NAME, path=f"/{path_prefix}/")
 
 def _request_has_access(account_name):
     if not _is_access_control_enabled(account_name):
@@ -1474,15 +1634,13 @@ $('addBtn').addEventListener('click', async () => {
     const s = await r.json();
     addState.required = !!s.password_required;
     addState.exists = !!s.password_exists;
-    if(!addState.required){
-      addState.password = '';
-      setStatus('unlockStatus', '');
-      showForm();
-      return;
-    }
+    // SECURITY FIX: a password step used to be skipped entirely for the
+    // very first account on a fresh install, so it was created without any
+    // password protecting it. The server now always requires one
+    // (`password_required` is always true), and this step is always shown.
     $('unlockTitle').textContent = addState.exists
       ? 'Введите пароль'
-      : 'Придумайте пароль (минимум 4 символа)';
+      : 'Придумайте пароль (минимум 8 символов)';
     $('unlockPwd').placeholder = 'Пароль';
     setStatus('unlockStatus', '');
     showStep('unlockStep');
@@ -2311,7 +2469,6 @@ audio.media-preview{min-height:56px}
 
 <script>
 const PFX = '/' + window.location.pathname.split('/')[1] + '/';
-const SECRET_PWD = '__SECRET_PASSWORD__';
 
 let tab='all', debounceT=null, lastSig={all:null, hidden:null};
 
@@ -2608,28 +2765,61 @@ function stoast(m){
   t.textContent=m; t.classList.add('show');
   setTimeout(()=>t.classList.remove('show'), 1200);
 }
-function secOpen(){
+function secShowMain(){
+  document.getElementById('sec_pwd_screen').style.display='none';
+  document.getElementById('sec_main_screen').style.display='block';
+  secState.mode=localStorage.getItem('sec_mode')||'pc';
+  document.querySelectorAll('.sec_mode_btn').forEach(b=>b.classList.toggle('active',b.dataset.mode===secState.mode));
+}
+async function secOpen(){
   document.getElementById('secret_overlay').style.display='flex';
   document.getElementById('sec_pwd_screen').style.display='block';
   document.getElementById('sec_main_screen').style.display='none';
   document.getElementById('sec_pwd').value='';
   document.getElementById('sec_pwd_err').style.display='none';
+  // The secret section is server-side gated (api/secret/verify sets a
+  // short-lived cookie). If this browser already holds a valid cookie,
+  // skip straight to the panel instead of asking again.
+  try{
+    const j=await (await fetch(PFX+'api/secret/status')).json();
+    if(j && j.ok && j.unlocked){ secShowMain(); }
+  }catch(e){}
 }
 function secClose(){
   document.getElementById('secret_overlay').style.display='none';
   document.getElementById('sec_ctx_menu').style.display='none';
 }
-function secVerify(){
+async function secFetch(url, opts){
+  // Every api/secret/* call is enforced server-side; if the secret cookie
+  // is missing/expired the server replies 403 {error:'secret_locked'} and
+  // we fall back to the password screen instead of silently failing.
+  const r = await fetch(url, opts);
+  if(r.status===403){
+    try{
+      const j=await r.clone().json();
+      if(j && j.error==='secret_locked'){ secOpen(); }
+    }catch(e){}
+  }
+  return r;
+}
+async function secVerify(){
   const pwd=document.getElementById('sec_pwd').value;
-  if(pwd!==SECRET_PWD){
-    document.getElementById('sec_pwd_err').style.display='block';
+  const errEl=document.getElementById('sec_pwd_err');
+  try{
+    const r=await secFetch(PFX+'api/secret/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pwd})});
+    const j=await r.json();
+    if(!j.ok){
+      errEl.textContent=j.error||'Неверный пароль';
+      errEl.style.display='block';
+      return;
+    }
+  }catch(e){
+    errEl.textContent='Ошибка сети';
+    errEl.style.display='block';
     return;
   }
-  document.getElementById('sec_pwd_err').style.display='none';
-  document.getElementById('sec_pwd_screen').style.display='none';
-  document.getElementById('sec_main_screen').style.display='block';
-  secState.mode=localStorage.getItem('sec_mode')||'pc';
-  document.querySelectorAll('.sec_mode_btn').forEach(b=>b.classList.toggle('active',b.dataset.mode===secState.mode));
+  errEl.style.display='none';
+  secShowMain();
 }
 function secSetMode(m){
   secState.mode=m;
@@ -2645,7 +2835,7 @@ async function secResolve(){
   document.getElementById('sec_err').style.display='none';
   document.getElementById('sec_chat_info').style.display='none';
   try{
-    const r=await fetch(PFX+'api/secret/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({identifier:v})});
+    const r=await secFetch(PFX+'api/secret/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({identifier:v})});
     const j=await r.json();
     document.getElementById('sec_loading').style.display='none';
     if(!j.ok || !j.results || !j.results.length){
@@ -2679,7 +2869,7 @@ async function secLoadChat(){
   if(!secState.chat_id) return;
   document.getElementById('sec_loading').style.display='block';
   try{
-    const r=await fetch(PFX+'api/secret/chat/'+secState.chat_id+'?limit=200');
+    const r=await secFetch(PFX+'api/secret/chat/'+secState.chat_id+'?limit=200');
     const j=await r.json();
     document.getElementById('sec_loading').style.display='none';
     if(!j.ok){document.getElementById('sec_err').textContent='Ошибка загрузки';document.getElementById('sec_err').style.display='block';return;}
@@ -2702,7 +2892,7 @@ async function secLoadFullHistory(){
   try{
     const controller=new AbortController();
     const timeoutId=setTimeout(()=>controller.abort(), 60000);
-    const r=await fetch(PFX+'api/secret/fetch_history',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:secState.chat_id,limit:99999}),signal:controller.signal});
+    const r=await secFetch(PFX+'api/secret/fetch_history',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:secState.chat_id,limit:99999}),signal:controller.signal});
     clearTimeout(timeoutId);
     const j=await r.json();
     if(!j.ok){
@@ -2771,7 +2961,7 @@ document.addEventListener('click',function(e){
 async function secDeleteSelf(){
   document.getElementById('sec_ctx_menu').style.display='none';
   try{
-    const r=await fetch(PFX+'api/secret/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:secState.ctxChatId,msg_ids:[secState.ctxMsgId],scope:'self'})});
+    const r=await secFetch(PFX+'api/secret/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:secState.ctxChatId,msg_ids:[secState.ctxMsgId],scope:'self'})});
     const j=await r.json();
     if(j.ok){stoast('Удалено');secLoadChat();}else stoast('Ошибка');
   }catch(e){stoast('Ошибка');}
@@ -2779,7 +2969,7 @@ async function secDeleteSelf(){
 async function secDeleteBoth(){
   document.getElementById('sec_ctx_menu').style.display='none';
   try{
-    const r=await fetch(PFX+'api/secret/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:secState.ctxChatId,msg_ids:[secState.ctxMsgId],scope:'both'})});
+    const r=await secFetch(PFX+'api/secret/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:secState.ctxChatId,msg_ids:[secState.ctxMsgId],scope:'both'})});
     const j=await r.json();
     if(j.ok){stoast('Удалено');secLoadChat();}else stoast('Ошибка');
   }catch(e){stoast('Ошибка');}
@@ -2789,7 +2979,7 @@ async function secEditMsg(){
   const newText=prompt('Новый текст:');
   if(!newText||!newText.trim()) return;
   try{
-    const r=await fetch(PFX+'api/secret/edit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:secState.ctxChatId,msg_id:secState.ctxMsgId,text:newText.trim()})});
+    const r=await secFetch(PFX+'api/secret/edit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:secState.ctxChatId,msg_id:secState.ctxMsgId,text:newText.trim()})});
     const j=await r.json();
     if(j.ok){stoast('Изменено');secLoadChat();}else stoast('Ошибка');
   }catch(e){stoast('Ошибка');}
@@ -2800,7 +2990,7 @@ async function secLoadMedia(){
   try{
     const controller=new AbortController();
     setTimeout(()=>controller.abort(), 30000);
-    const r=await fetch(PFX+'api/secret/chat/'+secState.chat_id+'/media',{signal:controller.signal});
+    const r=await secFetch(PFX+'api/secret/chat/'+secState.chat_id+'/media',{signal:controller.signal});
     const j=await r.json();
     document.getElementById('sec_loading').style.display='none';
     const g=document.getElementById('sec_media_grid');
@@ -2853,7 +3043,7 @@ async function secDebugDb(){
   const g=document.getElementById('sec_media_grid');
   g.innerHTML='<div class="small" style="text-align:center;padding:20px">Проверка БД...</div>';
   try{
-    const r=await fetch(PFX+'api/secret/chat/'+secState.chat_id+'?limit=50');
+    const r=await secFetch(PFX+'api/secret/chat/'+secState.chat_id+'?limit=50');
     const j=await r.json();
     if(!j.ok){g.innerHTML='<div class="small danger" style="padding:20px">Ошибка: '+esc(j.error)+'</div>';return;}
     const types={};
@@ -2873,7 +3063,7 @@ async function secDownloadMedia(msgId, btn){
   btn.disabled=true;
   btn.textContent='&#x23F3;...';
   try{
-    const r=await fetch(PFX+'api/secret/download_media',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:secState.chat_id,msg_id:msgId})});
+    const r=await secFetch(PFX+'api/secret/download_media',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:secState.chat_id,msg_id:msgId})});
     const j=await r.json();
     if(j.ok){
       stoast('&#x2705; Скачано');
@@ -2893,7 +3083,7 @@ async function secSendToBotMsg(msgId){
   if(!secState.chat_id) return;
   if(!confirm('Отправить это медиа в тайного бота?')) return;
   try{
-    const r=await fetch(PFX+'api/secret/send_to_bot_msg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:secState.chat_id,msg_id:msgId})});
+    const r=await secFetch(PFX+'api/secret/send_to_bot_msg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:secState.chat_id,msg_id:msgId})});
     const j=await r.json();
     if(j.ok) stoast('&#x2705; Отправлено');
     else stoast('&#x274C; '+j.error);
@@ -2906,7 +3096,7 @@ async function secSendToBot(){
   if(!confirm('Отправить все медиа в бота?')) return;
   document.getElementById('sec_loading').style.display='block';
   try{
-    const r=await fetch(PFX+'api/secret/send_to_bot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:secState.chat_id,media_type:'all'})});
+    const r=await secFetch(PFX+'api/secret/send_to_bot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:secState.chat_id,media_type:'all'})});
     const j=await r.json();
     document.getElementById('sec_loading').style.display='none';
     if(j.ok) stoast('Отправлено: '+j.sent+(j.errors?' ('+j.errors+' ошибок)':''));
@@ -3015,36 +3205,55 @@ def create_account_blueprint():
             return None
 
         allowed, stale_hash = _request_has_access(_acct())
-        if allowed:
-            return None
+        if not allowed:
+            if stale_hash:
+                _log(f"stale auth cookie for ip={_get_client_ip()}")
 
-        if stale_hash:
-            _log(f"stale auth cookie for ip={_get_client_ip()}")
+            if path.startswith(f"/{_acct()}/api/"):
+                resp = jsonify({"ok": False, "auth_required": True, "error": "authorization required"})
+                _clear_access_cookies(resp, _acct())
+                return resp, 401
 
-        if path.startswith(f"/{_acct()}/api/"):
-            resp = jsonify({"ok": False, "auth_required": True, "error": "authorization required"})
+            resp = Response(AUTH_GATE_HTML, mimetype="text/html", status=401)
             _clear_access_cookies(resp, _acct())
-            return resp, 401
+            return resp
 
-        resp = Response(AUTH_GATE_HTML, mimetype="text/html", status=401)
-        _clear_access_cookies(resp, _acct())
-        return resp
+        # SECURITY FIX: the "secret" sub-panel (reading/deleting/editing real
+        # Telegram messages, media download, full history fetch) must be
+        # gated server-side on its own password, not merely on the general
+        # panel login above. `/api/secret/verify` and `/api/secret/status`
+        # are reachable without the secret cookie (one checks the password,
+        # the other only reports whether it's already set).
+        if path.startswith(f"/{_acct()}/api/secret/") and \
+                path not in (f"/{_acct()}/api/secret/verify", f"/{_acct()}/api/secret/status"):
+            if not _secret_unlocked(_acct()):
+                return jsonify({"ok": False, "error": "secret_locked"}), 403
+
+        return None
 
     bp.before_request(_bp_before_request)
 
     @bp.get("/<account>/")
     def index(account=None):
         _set_ctx()
-        secret_pwd = _get_account_secret_password(_acct())
-        html = HTML_TEMPLATE.replace("__ACCOUNT_NAME__", _acct()).replace("__SECRET_PASSWORD__", secret_pwd)
+        # SECURITY: the secret password used to be injected directly into the
+        # HTML/JS sent to the browser and compared client-side - anyone could
+        # read it via "View Source". It is now verified exclusively server
+        # side (see api_secret_verify / _secret_unlocked), so nothing secret
+        # is ever embedded in the page.
+        html = HTML_TEMPLATE.replace("__ACCOUNT_NAME__", _acct())
         return Response(html, mimetype="text/html")
 
     @bp.post("/<account>/api/auth/request")
     def api_auth_request(account=None):
         _set_ctx()
         cfg = _load_gui_cfg(_acct())
-        if not _is_access_control_enabled(_acct()):
-            return jsonify({"ok": False, "error": "Access control is disabled or Telegram bot is not configured."}), 400
+        if not cfg.get("access_control_enabled", True):
+            return jsonify({"ok": False, "error": "Access control is disabled for this account."}), 400
+        bot_token = str(cfg.get("bot_token") or "").strip()
+        chat_id_cfg = str(cfg.get("access_chat_id") or cfg.get("bot_chat_id") or "").strip()
+        if not bot_token or not chat_id_cfg:
+            return jsonify({"ok": False, "error": "Telegram bot is not configured. Use the password login instead."}), 400
 
         device_id = get_or_create_device_id(request.cookies.get(DEVICE_COOKIE_NAME))
         user_agent = request.headers.get("User-Agent", "")
@@ -3108,7 +3317,7 @@ def create_account_blueprint():
         if locked:
             return jsonify({"ok": False,
                             "error": f"Слишком много попыток. Попробуйте через {locked} сек."}), 429
-        if not password or not _safe_eq(password, secret_pwd):
+        if not password or not _verify_password(password, secret_pwd):
             _auth_register_fail(key)
             time.sleep(1.0)
             return jsonify({"ok": False, "error": "Invalid password"}), 403
@@ -3132,6 +3341,7 @@ def create_account_blueprint():
         _set_ctx()
         resp = jsonify({"ok": True})
         _clear_access_cookies(resp, _acct())
+        _clear_secret_cookie(resp, _acct())
         return resp
 
     @bp.get("/<account>/api/settings")
@@ -3561,21 +3771,29 @@ def create_account_blueprint():
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)})
 
+    @bp.get("/<account>/api/secret/status")
+    def api_secret_status(account=None):
+        _set_ctx()
+        return jsonify({"ok": True, "unlocked": _secret_unlocked(_acct())})
+
     @bp.post("/<account>/api/secret/verify")
     def api_secret_verify(account=None):
         _set_ctx()
         data = request.get_json(silent=True) or {}
         pwd = data.get("password", "")
         secret_pwd = _get_account_secret_password(_acct())
-        key = _client_key()
+        key = "secret:" + _client_key()
         if _auth_locked(key):
             return jsonify({"ok": False, "error": "Too many attempts"})
-        if not _safe_eq(str(pwd or ""), str(secret_pwd or "")):
+        if not pwd or not _verify_password(str(pwd), secret_pwd):
             _auth_register_fail(key)
             time.sleep(1.0)
             return jsonify({"ok": False, "error": "Invalid password"})
         _auth_clear(key)
-        return jsonify({"ok": True})
+        resp = jsonify({"ok": True})
+        _attach_secret_cookie(resp, _acct())
+        _log(f"secret unlocked ip={_get_client_ip()}")
+        return resp
 
     @bp.post("/<account>/api/secret/resolve")
     def api_secret_resolve(account=None):
@@ -3585,19 +3803,26 @@ def create_account_blueprint():
         if not identifier:
             return jsonify({"ok": False, "error": "Enter username/phone/ID"})
 
-        set_account(_acct())
-        dp = db_path()
-        conn = sqlite3.connect(dp)
-        cur = conn.cursor()
-        clean = identifier.lstrip("@")
-        cur.execute("""
-            SELECT DISTINCT chat_id, chat_title, username, chat_type
-            FROM messages
-            WHERE username LIKE ? OR chat_title LIKE ? OR CAST(chat_id AS TEXT) LIKE ?
-            LIMIT 10
-        """, (f"%{clean}%", f"%{identifier}%", f"%{identifier}%"))
-        rows = cur.fetchall()
-        conn.close()
+        rows = []
+        if _db_ok(_acct()):
+            # BUG FIX: same lazily-created-schema issue as the other /secret/
+            # endpoints - avoid a raw 500 when `messages` doesn't exist yet.
+            _ensure_schema(_acct())
+            set_account(_acct())
+            dp = db_path()
+            conn = sqlite3.connect(dp)
+            try:
+                cur = conn.cursor()
+                clean = identifier.lstrip("@")
+                cur.execute("""
+                    SELECT DISTINCT chat_id, chat_title, username, chat_type
+                    FROM messages
+                    WHERE username LIKE ? OR chat_title LIKE ? OR CAST(chat_id AS TEXT) LIKE ?
+                    LIMIT 10
+                """, (f"%{clean}%", f"%{identifier}%", f"%{identifier}%"))
+                rows = cur.fetchall()
+            finally:
+                conn.close()
 
         if rows:
             results = [{"chat_id": r[0], "title": r[1], "username": r[2], "chat_type": r[3]} for r in rows]
@@ -3634,31 +3859,42 @@ def create_account_blueprint():
         limit = min(int(request.args.get("limit", 200)), 500)
         offset = max(0, int(request.args.get("offset", 0)))
 
+        # BUG FIX: without this, a freshly created account (whose `messages`
+        # table has never been created, since that normally happens lazily
+        # from /api/messages or /api/stats) returned a raw 500/traceback
+        # here instead of an empty, well-formed result.
+        if not _db_ok(_acct()):
+            return jsonify({"ok": True, "chat_id": chat_id, "chat_title": f"Chat {chat_id}",
+                             "chat_type": "", "total": 0, "items": []})
+        _ensure_schema(_acct())
+
         set_account(_acct())
         dp = db_path()
         conn = sqlite3.connect(dp)
         conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
+        try:
+            cur = conn.cursor()
 
-        cur.execute("""
-            SELECT chat_id, msg_id, chat_title, chat_type, sender, username, phone,
-                   text, date, media_path, media_type, is_deleted, is_ephemeral, is_outgoing
-            FROM messages
-            WHERE chat_id=?
-            ORDER BY date DESC
-            LIMIT ? OFFSET ?
-        """, (chat_id, limit, offset))
-        rows = [dict(r) for r in cur.fetchall()]
+            cur.execute("""
+                SELECT chat_id, msg_id, chat_title, chat_type, sender, username, phone,
+                       text, date, media_path, media_type, is_deleted, is_ephemeral, is_outgoing
+                FROM messages
+                WHERE chat_id=?
+                ORDER BY date DESC
+                LIMIT ? OFFSET ?
+            """, (chat_id, limit, offset))
+            rows = [dict(r) for r in cur.fetchall()]
 
-        cur.execute("SELECT COUNT(*) FROM messages WHERE chat_id=?", (chat_id,))
-        total = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM messages WHERE chat_id=?", (chat_id,))
+            total = cur.fetchone()[0]
 
-        cur.execute("""
-            SELECT chat_title, chat_type, MIN(date), MAX(date)
-            FROM messages WHERE chat_id=? GROUP BY chat_title, chat_type
-        """, (chat_id,))
-        info = cur.fetchone()
-        conn.close()
+            cur.execute("""
+                SELECT chat_title, chat_type, MIN(date), MAX(date)
+                FROM messages WHERE chat_id=? GROUP BY chat_title, chat_type
+            """, (chat_id,))
+            info = cur.fetchone()
+        finally:
+            conn.close()
 
         items = []
         for r in reversed(rows):
@@ -3695,21 +3931,28 @@ def create_account_blueprint():
         except (ValueError, TypeError):
             return jsonify({"ok": False, "error": "Invalid chat_id"})
 
+        # BUG FIX: same lazily-created-schema issue as api_secret_chat above.
+        if not _db_ok(_acct()):
+            return jsonify({"ok": True, "items": [], "count": 0, "db_rows": 0})
+        _ensure_schema(_acct())
+
         set_account(_acct())
         dp = db_path()
         conn = sqlite3.connect(dp)
         conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT msg_id, text, date, media_path, media_type, is_outgoing
-            FROM messages
-            WHERE chat_id=?
-              AND (media_path IS NOT NULL AND media_path != ''
-                   OR media_type IS NOT NULL AND media_type != '')
-            ORDER BY date DESC
-        """, (chat_id,))
-        rows = [dict(r) for r in cur.fetchall()]
-        conn.close()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT msg_id, text, date, media_path, media_type, is_outgoing
+                FROM messages
+                WHERE chat_id=?
+                  AND (media_path IS NOT NULL AND media_path != ''
+                       OR media_type IS NOT NULL AND media_type != '')
+                ORDER BY date DESC
+            """, (chat_id,))
+            rows = [dict(r) for r in cur.fetchall()]
+        finally:
+            conn.close()
 
         audio_exts = {'.ogg', '.opus', '.oga', '.wav', '.mp3', '.m4a', '.aac', '.flac'}
         items = []
@@ -3740,18 +3983,25 @@ def create_account_blueprint():
 
         if not chat_id or not msg_ids:
             return jsonify({"ok": False, "error": "chat_id and msg_ids required"})
+        try:
+            chat_id = int(chat_id)
+            msg_ids = [int(m) for m in msg_ids]
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "chat_id and msg_ids must be integers"}), 400
 
         set_account(_acct())
         dp = db_path()
         conn = sqlite3.connect(dp, timeout=10)
-        cur = conn.cursor()
-        for mid in msg_ids:
-            cur.execute("""
-                UPDATE messages SET is_deleted=1, sent_to_bot=1
-                WHERE chat_id=? AND msg_id=?
-            """, (int(chat_id), int(mid)))
-        conn.commit()
-        conn.close()
+        try:
+            cur = conn.cursor()
+            for mid in msg_ids:
+                cur.execute("""
+                    UPDATE messages SET is_deleted=1, sent_to_bot=1
+                    WHERE chat_id=? AND msg_id=?
+                """, (chat_id, mid))
+            conn.commit()
+        finally:
+            conn.close()
 
         if scope == "both":
             acct_dir = account_dir()
@@ -3785,14 +4035,21 @@ def create_account_blueprint():
 
         if not chat_id or not msg_id or not new_text:
             return jsonify({"ok": False, "error": "chat_id, msg_id and text required"})
+        try:
+            chat_id = int(chat_id)
+            msg_id = int(msg_id)
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "chat_id and msg_id must be integers"}), 400
 
         set_account(_acct())
         dp = db_path()
         conn = sqlite3.connect(dp, timeout=10)
-        cur = conn.cursor()
-        cur.execute("UPDATE messages SET text=? WHERE chat_id=? AND msg_id=?", (new_text, int(chat_id), int(msg_id)))
-        conn.commit()
-        conn.close()
+        try:
+            cur = conn.cursor()
+            cur.execute("UPDATE messages SET text=? WHERE chat_id=? AND msg_id=?", (new_text, chat_id, msg_id))
+            conn.commit()
+        finally:
+            conn.close()
 
         acct_dir = account_dir()
         secret_py = os.path.join(acct_dir, "secret_ops.py")
@@ -4035,7 +4292,17 @@ def init_account_runtime(name):
 
 
 def create_app():
-    app = Flask(__name__)
+    # static_folder=None: this app never ships a /static directory and has
+    # no reason to expose Flask's default static-file route, which would
+    # otherwise serve anything placed under a "static/" folder next to this
+    # file with no authentication at all.
+    app = Flask(__name__, static_folder=None)
+
+    # SECURITY FIX: used to fall back to a hard-coded default password
+    # ("uC1dyF7hoA5izT0") for /api/admin/* (full backup/export of every
+    # account's secrets and live Telegram sessions). A random one is now
+    # generated and hashed into passwords.json on first run if missing.
+    _ensure_admin_password_initialized()
 
     # One blueprint serves every account (/<account>/...), so an account added
     # at runtime from the selector is immediately available.

@@ -45,16 +45,26 @@ def _connect(account=None):
     return conn
 
 
+def _secure_file(path):
+    try:
+        if os.path.exists(path):
+            os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+
 def _connect_for(account):
     path = None
-    from common_paths import _ACCOUNTS_DIR
+    from common_paths import _ACCOUNTS_DIR, _secure_dir
     if account:
+        _secure_dir(os.path.join(_ACCOUNTS_DIR, account))
         path = os.path.join(_ACCOUNTS_DIR, account, "auth.db")
     else:
         from common_paths import auth_db_path as _adb
         path = _adb()
     conn = sqlite3.connect(path, timeout=15)
     conn.row_factory = sqlite3.Row
+    _secure_file(path)
     return conn
 
 

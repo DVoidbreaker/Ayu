@@ -1,10 +1,34 @@
 import os
+import stat
 import tempfile
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _ACCOUNTS_DIR = os.path.join(BASE_DIR, "accounts")
 
 _current_account = None
+
+
+def _secure_dir(path):
+    """Create `path` (and parents) and make sure it is only readable by the
+    owner (0700). Session files, auth DBs and message DBs live under these
+    directories, so a world-readable temp/account folder would let any other
+    local user or process read Telegram auth keys and private messages.
+    """
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except Exception:
+        pass
+    return path
+
+
+def _secure_file(path):
+    """Tighten permissions on an existing sensitive file (sessions, DBs)."""
+    try:
+        if os.path.exists(path):
+            os.chmod(path, 0o600)
+    except Exception:
+        pass
 
 
 def set_account(name):
@@ -20,8 +44,7 @@ def account_dir():
     name = get_current_account()
     if name:
         d = os.path.join(_ACCOUNTS_DIR, name)
-        os.makedirs(d, exist_ok=True)
-        return d
+        return _secure_dir(d)
     return BASE_DIR
 
 
@@ -47,20 +70,21 @@ def auth_db_path():
 
 def media_folder():
     d = os.path.join(account_dir(), "media", "anti_revoke")
-    os.makedirs(d, exist_ok=True)
-    return d
+    return _secure_dir(d)
 
 
 def log_dir():
     d = os.path.join(account_dir(), "logs")
-    os.makedirs(d, exist_ok=True)
-    return d
+    return _secure_dir(d)
 
 
 def session_dir():
+    # NOTE: the Telethon .session file holds a long-lived `auth_key` that is
+    # equivalent to a password-free login to the Telegram account, so this
+    # directory (even though it lives under the shared system temp dir) must
+    # never be left with default (often world-readable) permissions.
     d = os.path.join(tempfile.gettempdir(), "AuySoft", "anti_revoke", get_current_account() or "default")
-    os.makedirs(d, exist_ok=True)
-    return d
+    return _secure_dir(d)
 
 
 def session_base():

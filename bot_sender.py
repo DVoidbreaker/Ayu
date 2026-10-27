@@ -18,9 +18,6 @@ DEFAULT_GUI = {
     "exclude_from_bot": [],
 }
 
-LAST_UPDATE_ID = 0
-
-
 def load_secret_bot(account_name: str) -> dict:
     accounts_file = os.path.join(_ACCOUNTS_DIR, "..", "accounts.json")
     try:
@@ -36,44 +33,18 @@ def load_secret_bot(account_name: str) -> dict:
         pass
     return {}
 
-def check_callbacks(token):
-    global LAST_UPDATE_ID
+# NOTE (bug fix): this module used to contain `check_callbacks()` and
+# `check_auth_commands()`, which referenced `approve`/`deny` - names that
+# were never defined or imported anywhere in this file. Any Telegram
+# callback_query or `/approve` command arriving while that code ran would
+# have crashed with a NameError. Neither function was ever called from
+# `main()` (confirmed via a full-repo grep), so this was dead code with no
+# effect on current behaviour - but it was a landmine for whoever wired it
+# up next. The real, working implementation of this exact login-approval
+# flow already lives in `auth_layer.poll_telegram_callbacks_for_account()`
+# (started by `ensure_polling_started_for_account()` from the web app), so
+# the broken duplicate has been removed rather than "fixed" in place.
 
-    if requests is None:
-        return
-
-    try:
-        r = requests.get(
-            f"https://api.telegram.org/bot{token}/getUpdates",
-            params={"offset": LAST_UPDATE_ID + 1},
-            timeout=10
-        )
-
-        data = r.json()
-
-        for upd in data.get("result", []):
-            LAST_UPDATE_ID = upd["update_id"]
-
-            cb = upd.get("callback_query")
-            if not cb:
-                continue
-
-            data_cb = cb.get("data", "")
-            callback_id = cb.get("id")
-
-            requests.post(
-                f"https://api.telegram.org/bot{token}/answerCallbackQuery",
-                data={"callback_query_id": callback_id}
-            )
-
-            if data_cb.startswith("allow:") and approve:
-                approve(data_cb.split(":")[1])
-
-            elif data_cb.startswith("deny:") and deny:
-                deny(data_cb.split(":")[1])
-
-    except Exception as e:
-        _log(f"callback error: {e}")
 
 def _log(line: str):
     try:
@@ -215,32 +186,12 @@ def build_header(row: dict, account_name: str = "") -> str:
 
 def mark_sent(chat_id: int, msg_id: int):
     conn = sqlite3.connect(db_path(), timeout=10)
-    cur = conn.cursor()
-    cur.execute("UPDATE messages SET sent_to_bot=1 WHERE chat_id=? AND msg_id=?", (int(chat_id), int(msg_id)))
-    conn.commit()
-    conn.close()
-
-def check_auth_commands(token: str, chat_id: str):
-    if requests is None or not approve:
-        return
-
     try:
-        r = requests.get(
-            f"https://api.telegram.org/bot{token}/getUpdates",
-            timeout=10
-        )
-        data = r.json()
-
-        for upd in data.get("result", []):
-            msg = upd.get("message", {})
-            text = (msg.get("text") or "").strip()
-
-            if text.startswith("/approve"):
-                parts = text.split(" ")
-                if len(parts) >= 2:
-                    approve(parts[1])
-    except Exception:
-        pass
+        cur = conn.cursor()
+        cur.execute("UPDATE messages SET sent_to_bot=1 WHERE chat_id=? AND msg_id=?", (int(chat_id), int(msg_id)))
+        conn.commit()
+    finally:
+        conn.close()
 
 def main():
     if len(sys.argv) < 2:
