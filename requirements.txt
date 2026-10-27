@@ -1,0 +1,4 @@
+flask
+requests
+telethon==1.45.0
+itsdangerous
