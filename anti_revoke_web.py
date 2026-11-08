@@ -228,7 +228,21 @@ async def _tg_send_code(account_name, api_id, api_hash, phone, force_sms=False):
     # make the new code request silently fail.
     await _tg_discard(account_name)
     base = _login_session_base(account_name)
-    client = TelegramClient(base, int(api_id), str(api_hash))
+    # Human-like client metadata: Telethon's default fingerprints are
+    # "device_model='Python 3.x', app_version='telethon <ver>'". Telegram
+    # noticeably throttles silent in-app code delivery for requests that look
+    # machine-generated - the request succeeds (auth.SendCode returns OK) but
+    # the service message may arrive late or not at all. A desktop-client
+    # fingerprint removes that mismatch for the "code goes to the Telegram
+    # app" delivery path.
+    client = TelegramClient(
+        base, int(api_id), str(api_hash),
+        device_model="Desktop",
+        system_version="Windows 10 x64",
+        app_version="1.0.0",
+        lang_code="ru",
+        system_lang_code="ru",
+    )
     await client.connect()
     try:
         # force_sms=True makes Telegram deliver by SMS instead of into the
@@ -1801,7 +1815,8 @@ $('sendCodeBtn').addEventListener('click', async () => {
       const num = d.phone || phone;
       const via = d.sent_via === 'sms'
         ? 'Код отправлен по SMS на ' + num
-        : 'Код ушёл в приложение Telegram на ' + num + ' (официальный чат «Telegram»). Не видите код? Нажмите «Войти по QR (без кода)».';
+        : 'Код ушёл в приложение Telegram на ' + num + ' — откройте служебный чат «Telegram» (может лежать в архиве кода).' +
+          ' Код приходит за 1–2 минуты; «Отправить ещё раз» сбросит прежний код — подождите перед повтором.';
       setStatus('loginStatus', via, 'ok');
     }else{
       const code = ($('fldCode').value || '').trim();
@@ -1854,7 +1869,7 @@ $('resendBtn').addEventListener('click', async () => {
     $('fld2fa').value = '';
     const via = d.sent_via === 'sms'
       ? 'Код отправлен по SMS.'
-      : 'Код отправлен в приложение Telegram — откройте официальный чат «Telegram» и введите код оттуда.';
+      : 'Код отправлен в приложение Telegram — откройте служебный чат «Telegram» и введите код оттуда (сброс прежнего кода уже произведён).';
     setStatus('loginStatus', via, 'ok');
   }catch(e){
     setStatus('loginStatus', e.message || 'Ошибка подключения', 'err');
