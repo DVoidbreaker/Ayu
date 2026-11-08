@@ -1483,7 +1483,7 @@ p{margin:0; color:var(--muted); line-height:1.55}
         <div class="add-status" id="loginStatus"></div>
         <div class="add-row">
           <button class="add-go" id="sendCodeBtn" type="button">Отправить код</button>
-          <button class="add-back" id="qrBtn" type="button">Войти по QR</button>
+          <button class="add-back" id="qrBtn" type="button">Войти по QR (без кода)</button>
           <button class="add-back" id="resendBtn" type="button" style="display:none">Отправить ещё раз</button>
           <button class="add-back" id="loginSkipBtn" type="button">Пропустить</button>
         </div>
@@ -1744,6 +1744,7 @@ async function saveAccount(){
     $('qrPanel').style.display = 'none';
     $('qrBox').innerHTML = '';
     stopQrPolling();
+    qrAutoRestarts = 0;
     showStep('loginStep');
   }catch(e){
     setStatus('formStatus', e.message || 'Ошибка подключения', 'err');
@@ -1800,7 +1801,7 @@ $('sendCodeBtn').addEventListener('click', async () => {
       const num = d.phone || phone;
       const via = d.sent_via === 'sms'
         ? 'Код отправлен по SMS на ' + num
-        : 'Код ушёл в приложение Telegram на ' + num + ' (официальный чат «Telegram»). Не видите код? Нажмите «Войти по QR».';
+        : 'Код ушёл в приложение Telegram на ' + num + ' (официальный чат «Telegram»). Не видите код? Нажмите «Войти по QR (без кода)».';
       setStatus('loginStatus', via, 'ok');
     }else{
       const code = ($('fldCode').value || '').trim();
@@ -1865,6 +1866,7 @@ $('resendBtn').addEventListener('click', async () => {
 // --- QR login: the reliable path when the number is already logged in on a
 // phone. The user scans the code with that phone; no SMS/code needed. ---
 var qrPollTimer = null;
+var qrAutoRestarts = 0;   // auto-restarts of an expired QR before giving up
 
 function stopQrPolling(){
   if(qrPollTimer){ clearInterval(qrPollTimer); qrPollTimer = null; }
@@ -1899,9 +1901,25 @@ async function pollQr(){
       stopQrPolling();
       goBotStep();
     }else if(d.state === 'expired'){
+      // Telegram QR tokens live only a short while. Restart automatically so
+      // the user (who is mid-way moving the phone camera to the screen) is
+      // never left staring at a dead QR. Bounded auto-restarts keep a
+      // persistently failing backend from spinning forever.
+      qrAutoRestarts += 1;
+      if(qrAutoRestarts <= 5){
+        await startQrLogin();
+      }else{
+        stopQrPolling();
+        $('qrPanel').style.display = 'none';
+        setStatus('loginStatus', 'QR-код не обновляется — нажмите «Войти по QR» ещё раз.', 'err');
+      }
+    }else if(d.state === 'none'){
+      // The QR client was discarded elsewhere (e.g. a new code request was
+      // fired for this account). Previously this returned "pending" forever
+      // and the panel kept polling a dead QR. Stop and tell the user why.
       stopQrPolling();
       $('qrPanel').style.display = 'none';
-      setStatus('loginStatus', 'QR-код истёк — нажмите «Войти по QR» ещё раз.', 'err');
+      setStatus('loginStatus', 'Вход по QR остановлен — используйте код из Telegram или нажмите «Войти по QR» ещё раз.', 'err');
     }else if(d.state === 'error'){
       stopQrPolling();
       $('qrPanel').style.display = 'none';
@@ -1911,7 +1929,8 @@ async function pollQr(){
   }catch(e){ /* transient network hiccup; keep polling */ }
 }
 
-$('qrBtn').addEventListener('click', async () => {
+// Shared QR starter: used by the button click and by the auto-restart above.
+async function startQrLogin(){
   var btn = $('qrBtn');
   btn.disabled = true;
   stopQrPolling();
@@ -1928,17 +1947,24 @@ $('qrBtn').addEventListener('click', async () => {
       $('qrPanel').style.display = 'none';
       setStatus('loginStatus', d.error || 'Не удалось создать QR-код', 'err');
       if(r.status === 403){ addState.password=''; showStep('unlockStep'); }
-      return;
+      return false;
     }
     renderQr(d.url);
-    setStatus('loginStatus', 'Отсканируйте QR-код телефоном…', 'ok');
+    setStatus('loginStatus', 'Отсканируйте QR-код телефоном, где залогинен этот номер: Telegram → Настройки → Устройства → Подключить устройство.', 'ok');
     qrPollTimer = setInterval(pollQr, 2500);
+    return true;
   }catch(e){
     $('qrPanel').style.display = 'none';
     setStatus('loginStatus', e.message || 'Ошибка подключения', 'err');
+    return false;
   }finally{
     btn.disabled = false;
   }
+}
+
+$('qrBtn').addEventListener('click', async () => {
+  qrAutoRestarts = 0;   // a manual click starts a fresh retry budget
+  await startQrLogin();
 });
 
 // --- Bot step (saves bot token + chat id) ---
